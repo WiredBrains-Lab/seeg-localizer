@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seeg-localizer"
+version = "0.1.0"
+description = "CT-MRI coregistration, localization, and 3D visualization for sEEG electrodes"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Sunil Mathew" },
+]
+dependencies = [
+  "h5py",
+  "matplotlib",
+  "mne",
+  "nibabel",
+  "numpy",
+  "openpyxl",
+  "PyQt5",
+  "pyqtgraph",
+  "pyvista",
+  "pyvistaqt",
+  "QtPy",
+  "scipy",
+  "vtk",
+]
+
+[project.optional-dependencies]
+registration = [
+  "antspyx",
+  "dipy",
+  "SimpleITK",
+]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+seeg-localizer = "viewer3d.seeg_localizer:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "usercontrols*", "utils*", "viewer3d*"]

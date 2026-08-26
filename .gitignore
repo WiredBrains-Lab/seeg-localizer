@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and packaging output
+.venv/
+venv/
+build/
+dist/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
+# Local data, generated output, and common neuroimaging files
+data/
+local_data/
+outputs/
+subjects/
+fsaverage/
+*.dcm
+*.edf
+*.fif
+*.mat
+*.mgz
+*.nii
+*.nii.gz
+*.ns1
+*.ns2
+*.ns3
+*.ns4
+*.ns5
+*.ns6
+*.nsx
+*_elec_info.csv
+*_elec_info.xlsx
+
