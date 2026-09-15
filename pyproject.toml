@@ -7,6 +7,7 @@ name = "seeg-localizer"
 version = "0.1.0"
 description = "CT-MRI coregistration, localization, and 3D visualization for sEEG electrodes"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
   { name = "Sunil Mathew" },
@@ -18,6 +19,7 @@ dependencies = [
   "nibabel",
   "numpy",
   "openpyxl",
+  "Pillow",
   "PyQt5",
   "pyqtgraph",
   "pyvista",
@@ -43,3 +45,6 @@ seeg-localizer = "viewer3d.seeg_localizer:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["core*", "usercontrols*", "utils*", "viewer3d*"]
+
+[tool.setuptools.package-data]
+viewer3d = ["assets/*.png"]

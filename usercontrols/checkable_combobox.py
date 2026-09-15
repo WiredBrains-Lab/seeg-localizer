@@ -17,7 +17,7 @@ Notes
 
 from qtpy.QtWidgets import * 
 from qtpy.QtGui import QStandardItemModel
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QEvent
 
 class CheckableComboBox(QComboBox):
     """Combo box with checkable items.
@@ -34,8 +34,18 @@ class CheckableComboBox(QComboBox):
     def __init__(self, parent=None, width=140):
         super(CheckableComboBox, self).__init__(parent)
         self.setModel(QStandardItemModel(self))
-        self.count = 0
+        self.checked_count = 0
         self.setMinimumWidth(width) # pixels
+        self.view().viewport().installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        """Keep the popup open while users toggle multiple items."""
+        if (
+            watched is self.view().viewport()
+            and event.type() == QEvent.MouseButtonRelease
+        ):
+            return True
+        return super().eventFilter(watched, event)
 
     # action called when item get checked
     def do_action(self):
@@ -46,7 +56,7 @@ class CheckableComboBox(QComboBox):
         Override to react to item checks (e.g., update UI). Default prints
         a debug message.
         """
-        print("Checked number : " +str(self.count))
+        print("Checked number : " +str(self.checked_count))
 
     # when any item get pressed
     def handleItemPressed(self, index):
@@ -65,13 +75,14 @@ class CheckableComboBox(QComboBox):
 
             # making it unchecked
             item.setCheckState(Qt.Unchecked)
+            self.checked_count = max(0, self.checked_count - 1)
 
         # if not checked
         else:
             # making the item checked
             item.setCheckState(Qt.Checked)
 
-            self.count += 1
+            self.checked_count += 1
 
             # call the action
             self.do_action()

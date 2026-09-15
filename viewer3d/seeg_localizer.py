@@ -1,6 +1,6 @@
 """
 Author: Sunil Mathew
-Date: 05 December 2023
+Date: 05 December 2025
 
 This class implements sEEG Localizer using MNE-Python's fsaverage data.
 The patient's CT/MRI can be coregistered to use the 3D model and associated segmentations of different
@@ -22,7 +22,7 @@ Cohort MNI Workflow:
 --------------------
 1. Select a common root containing patient ``*_elec_info.csv`` exports
 2. Load only rows with saved ``mni_x``, ``mni_y``, and ``mni_z`` coordinates
-3. Display all contacts on fsaverage, colored by location label and filterable by patient
+3. Display all contacts on fsaverage, colored by location label and filterable by patients
 4. No patient CT, MRI, transform, or individual FreeSurfer surface is loaded
 
 Registration Methods:
@@ -67,6 +67,16 @@ from usercontrols.checkable_combobox import CheckableComboBox
 PROFILE_MERGE = bool(int(os.getenv("SEEG_LOCALIZER_PROFILE_MERGE", "1")))
 from viewer3d.postop_ct_reg import RegistrationDialog
 from viewer3d.mni_cohort import load_mni_cohort
+from viewer3d.cohort_pooling import pool_mni_contacts
+from viewer3d.cohort_smoothing import CorticalGaussianField
+from viewer3d.cohort_colors import symmetric_color_limit, scalar_colormap
+from viewer3d.publication_export import save_publication_image
+from viewer3d.cohort_lookup import (
+    LESION_COLUMNS,
+    cohort_contact_is_visible,
+    load_cohort_lookup,
+    match_cohort_lookup,
+)
 from core.source_parcellation import (
     HCP_MMP_PARCS,
     aseg_name_from_path,
@@ -78,6 +88,73 @@ GRAY_MATTER_LABELS = {
     3, 42, 8, 47, 10, 11, 12, 13, 16, 17, 18, 26, 28, 49, 50, 51, 52, 53, 54, 58, 60
 }
 WHITE_MATTER_LABELS = {2, 41, 7, 46}
+
+
+APPLICATION_NAME = "sEEG Localizer"
+
+
+def _application_version():
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("seeg-localizer")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _prepare_application_identity():
+    """Set the macOS bundle name before Qt or MNE creates native menus."""
+    if sys.platform == "darwin":
+        try:
+            from Foundation import NSBundle
+        except ImportError:
+            pass  # Qt uses applicationDisplayName when no bundle name is set.
+        else:
+            bundle = NSBundle.mainBundle()
+            for info in (bundle.infoDictionary(), bundle.localizedInfoDictionary()):
+                if info is not None:
+                    info["CFBundleName"] = APPLICATION_NAME
+                    info["CFBundleDisplayName"] = APPLICATION_NAME
+    QtCore.QCoreApplication.setApplicationName(APPLICATION_NAME)
+    QtCore.QCoreApplication.setOrganizationName("WiredBrainsLab")
+
+
+def _apply_application_identity(app):
+    """Restore our identity after MNE initializes or recreates a renderer."""
+    app.setApplicationName(APPLICATION_NAME)
+    app.setApplicationDisplayName(APPLICATION_NAME)
+    app.setOrganizationName("WiredBrainsLab")
+    app.setApplicationVersion(_application_version())
+
+
+def _application_icon_path():
+    """Locate the runtime PNG in a source checkout or PyInstaller bundle."""
+    candidates = []
+    pyinstaller_root = getattr(sys, "_MEIPASS", None)
+    if pyinstaller_root:
+        candidates.append(Path(pyinstaller_root) / "seeg-localizer-icon.png")
+    candidates.append(
+        Path(__file__).resolve().parents[1]
+        / "packaging"
+        / "macos"
+        / "seeg-localizer-icon.png"
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _apply_application_icon(app, window=None):
+    """Set our icon before MNE initializes its Qt backend."""
+    _apply_application_identity(app)
+    icon_path = _application_icon_path()
+    if icon_path is None:
+        return None
+    icon = QtGui.QIcon(str(icon_path))
+    if icon.isNull():
+        return None
+    app.setWindowIcon(icon)
+    if window is not None:
+        window.setWindowIcon(icon)
+    return icon
 
 class SEEGLocalizer:
 
@@ -123,7 +200,7 @@ class SEEGLocalizer:
         self.mni_cohort_summary = None
         self.mni_cohort_root = None
         self.mni_cohort_active = False
-        self.mni_cohort_patient_filter = None
+        self.mni_cohort_selected_patients = None
         self.mni_cohort_show_labels = True
         self._mni_cohort_label_positions = []
         self._mni_cohort_label_texts = []
@@ -134,12 +211,53 @@ class SEEGLocalizer:
         self.mni_cohort_labels_checkbox = None
         self.mni_cohort_clear_btn = None
         self.mni_cohort_status_label = None
+        self.mni_cohort_lookup = None
+        self.mni_cohort_lookup_matches = None
+        self.mni_cohort_scalar_column = None
+        self.mni_cohort_lookup_filter = False
+        self.mni_cohort_shared_scale = True
+        self.mni_color_auto_mode = "full"
+        self.mni_color_percentile = 95.0
+        self.mni_color_manual_limits = {}
+        self.mni_color_locked_limit = None
+        self.mni_color_enhance = False
+        self.mni_field_visibility = 1.0
+        self.mni_color_controls = {}
+        self._display_details_expanded = False
+        self.display_details_button = None
+        self.display_details_panel = None
+        self.mni_cohort_smooth_enabled = False
+        self.mni_cohort_smooth_fwhm = 15.0
+        self.mni_cohort_smooth_checkbox = None
+        self.mni_cohort_smooth_spin = None
+        self._mni_cohort_smooth_geometry = {}
+        self._mni_cohort_smooth_summary = {}
+        self.mni_cohort_pool_enabled = False
+        self.mni_cohort_pool_diameter = 10.0
+        self.mni_cohort_pool_checkbox = None
+        self.mni_cohort_pool_spin = None
+        self._mni_cohort_pooled_groups = []
+        self._mni_cohort_scalar_bar_title = None
+        self.mni_cohort_lookup_load_btn = None
+        self.mni_cohort_color_combo = None
+        self.mni_cohort_lookup_filter_checkbox = None
+        self.mni_cohort_shared_scale_checkbox = None
+        self.mni_cohort_lookup_clear_btn = None
+        self.mni_cohort_export_btn = None
+        self.publication_image_btn = None
+        self.mni_cohort_lookup_status_label = None
         self._detected_electrode_actors = []
         self._detected_shaft_actors = []
         self._detected_shaft_label_actors = []
         self.brain_surface = "pial"
+        self.surface_buttons = {}
+        self._pending_surface_change = None
+        self._surface_change_scheduled = False
+        self._surface_switch_in_progress = False
+        self._flat_projection_cache = {}
         self.brain_cortex_style = "classic"
-        self.brain_opacity = 0.85
+        self.brain_opacity = 0.25
+        self.shaft_opacity = 0.5
         self._brain_surface_actors = []
         self._surface_vertex_cache = {}
         self._surface_kdtree_cache = {}
@@ -155,6 +273,8 @@ class SEEGLocalizer:
         self.subject_view_combo = None
         self.brain_transparency_slider = None
         self.brain_transparency_value_label = None
+        self.shaft_transparency_slider = None
+        self.shaft_transparency_value_label = None
 
         if self.chs_3d_view is not None:
             self._register_cleanup_hooks()
@@ -328,9 +448,12 @@ class SEEGLocalizer:
         """
         if not self.force_fsaverage and self.custom_subject and self.custom_subjects_dir:
             return self.custom_subject, self.custom_subjects_dir
-        # Use fsaverage as the default visualization subject.
-        fsaverage_dir = Path(fetch_fsaverage(verbose=False))
-        return "fsaverage", fsaverage_dir.parent
+        # Keep MNE's fsaverage files with the writable sample dataset rather
+        # than relying on SUBJECTS_DIR, which can point at a root-owned
+        # FreeSurfer installation (for example, under /Applications).
+        subjects_dir = Path(mne.datasets.sample.data_path()) / "subjects"
+        fetch_fsaverage(subjects_dir=subjects_dir, verbose=False)
+        return "fsaverage", subjects_dir
 
     #endregion freesurfer setup
 
@@ -449,7 +572,9 @@ class SEEGLocalizer:
             alpha=self.brain_opacity,
             background="white",
             surf=self.brain_surface,
-            silhouette=True,
+            views="flat" if self.brain_surface == "flat" else "lateral",
+            # VTK silhouette decimation is unsuitable for planar patch meshes.
+            silhouette=self.brain_surface != "flat",
             show=False,
         )
         self._finalize_brain_scene(reset_camera=True)
@@ -484,10 +609,17 @@ class SEEGLocalizer:
             self.label_names = mne.get_volume_labels_from_aseg(str(fname_aseg))
             print(f"  Found {len(self.label_names)} segmentation labels")
             
-            # Use temporal regions as the initial sEEG-focused label selection.
-            temporal_areas = ['ctx-lh-superiortemporal', 'ctx-lh-inferiortemporal', 'ctx-lh-middletemporal',
-                              'ctx-lh-temporalpole', 'ctx-lh-transversetemporal', 'ctx-lh-parahippocampal']
-            self.active_labels = [label for label in self.label_names if label in temporal_areas]
+            # Keep parcellations available in the label controls, but do not
+            # eagerly render a default set of temporal regions at startup.
+            # temporal_areas = [
+            #     'ctx-lh-superiortemporal', 'ctx-lh-inferiortemporal',
+            #     'ctx-lh-middletemporal', 'ctx-lh-temporalpole',
+            #     'ctx-lh-transversetemporal', 'ctx-lh-parahippocampal',
+            # ]
+            # self.active_labels = [
+            #     label for label in self.label_names if label in temporal_areas
+            # ]
+            self.active_labels = []
             
             # Add volume labels to the brain visualization
             legend_kwargs = dict(bcolor=None)
@@ -671,6 +803,7 @@ class SEEGLocalizer:
         self._orientation_widget = None
         self._orientation_widget_plotter = None
         self._brain_surface_actors = []
+        self._flat_projection_cache = {}
 
         brain = getattr(self, "brain", None)
         self.brain = None
@@ -848,6 +981,10 @@ class SEEGLocalizer:
             "Superior",
             "Inferior",
             "Anterior",
+            "LAO20",
+            "LAO30",
+            "RAO20",
+            "RAO30",
             "Posterior",
             "Left",
             "Right",
@@ -882,17 +1019,19 @@ class SEEGLocalizer:
         self.mni_cohort_load_btn.clicked.connect(self._browse_mni_cohort_directory)
         cohort_layout.addWidget(self.mni_cohort_load_btn)
 
-        self.mni_cohort_patient_combo = QtWidgets.QComboBox()
-        self.mni_cohort_patient_combo.setToolTip("Show all cohort patients or one patient")
-        self.mni_cohort_patient_combo.currentIndexChanged.connect(
-            self._on_mni_cohort_patient_changed
+        self.mni_cohort_patient_combo = CheckableComboBox(width=180)
+        self.mni_cohort_patient_combo.setToolTip(
+            "Check the cohort patients to display; uncheck patients to hide them"
+        )
+        self.mni_cohort_patient_combo.view().pressed.connect(
+            self._on_mni_cohort_patient_pressed
         )
         cohort_layout.addWidget(self.mni_cohort_patient_combo)
 
         self.mni_cohort_labels_checkbox = QtWidgets.QCheckBox("Labels")
         self.mni_cohort_labels_checkbox.setChecked(self.mni_cohort_show_labels)
         self.mni_cohort_labels_checkbox.setToolTip(
-            "Show or hide patient and shaft/location labels in the MNI cohort view"
+            "Show or hide 3D electrode labels in single-patient and MNI cohort views"
         )
         self.mni_cohort_labels_checkbox.stateChanged.connect(
             self._on_mni_cohort_labels_changed
@@ -911,6 +1050,7 @@ class SEEGLocalizer:
         cohort_layout.addWidget(self.mni_cohort_status_label)
         cohort_layout.addStretch()
         layout.addLayout(cohort_layout)
+        self._create_mni_lookup_controls(layout)
         self._sync_mni_cohort_controls()
 
         surface_layout = QtWidgets.QHBoxLayout()
@@ -918,10 +1058,7 @@ class SEEGLocalizer:
         surface_label = QtWidgets.QLabel("Surface:")
         surface_label.setStyleSheet("QLabel { font-size: 11px; font-weight: bold; color: #555555; }")
         surface_layout.addWidget(surface_label)
-        self.inflated_surface_checkbox = QtWidgets.QCheckBox("Inflated")
-        self.inflated_surface_checkbox.setChecked(self.brain_surface == "inflated")
-        self.inflated_surface_checkbox.stateChanged.connect(self._toggle_inflated_surface)
-        surface_layout.addWidget(self.inflated_surface_checkbox)
+        self._create_surface_controls(surface_layout)
         surface_layout.addSpacing(10)
         transparency_label = QtWidgets.QLabel("Transparency:")
         transparency_label.setStyleSheet("QLabel { font-size: 11px; font-weight: bold; color: #555555; }")
@@ -941,6 +1078,26 @@ class SEEGLocalizer:
         self.brain_transparency_value_label.setStyleSheet("QLabel { font-size: 11px; color: #555555; min-width: 36px; }")
         surface_layout.addWidget(self.brain_transparency_value_label)
 
+        surface_layout.addSpacing(10)
+        shaft_label = QtWidgets.QLabel("Shaft transparency:")
+        shaft_label.setStyleSheet("QLabel { font-size: 11px; color: #555555; }")
+        surface_layout.addWidget(shaft_label)
+        self.shaft_transparency_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.shaft_transparency_slider.setRange(0, 100)
+        self.shaft_transparency_slider.setFixedWidth(140)
+        shaft_transparency = int(round((1.0 - self.shaft_opacity) * 100))
+        self.shaft_transparency_slider.setValue(shaft_transparency)
+        self.shaft_transparency_slider.setToolTip(
+            "Adjust the connecting shafts only. Set to 100% to hide shafts and keep contacts."
+        )
+        self.shaft_transparency_slider.valueChanged.connect(self._on_shaft_transparency_changed)
+        surface_layout.addWidget(self.shaft_transparency_slider)
+        self.shaft_transparency_value_label = QtWidgets.QLabel(f"{shaft_transparency}%")
+        self.shaft_transparency_value_label.setStyleSheet(
+            "QLabel { font-size: 11px; color: #555555; min-width: 36px; }"
+        )
+        surface_layout.addWidget(self.shaft_transparency_value_label)
+
         surface_layout.addStretch()
         layout.addLayout(surface_layout)
 
@@ -950,7 +1107,156 @@ class SEEGLocalizer:
         layout.addWidget(status_label)
 
         file_browser_widget.setLayout(layout)
+        self._compact_viewer_controls(file_browser_widget, layout)
         return file_browser_widget
+
+    def _compact_viewer_controls(self, container, layout):
+        """Arrange existing controls without replacing their signals or state."""
+        colors = self.mni_color_controls
+        widgets = [
+            self.coreg_toggle_btn, self.view_combo, self.subject_view_combo,
+            self.mni_cohort_load_btn, self.mni_cohort_patient_combo,
+            self.mni_cohort_labels_checkbox, self.mni_cohort_clear_btn,
+            self.mni_cohort_status_label, self.mni_cohort_lookup_load_btn,
+            self.mni_cohort_color_combo, self.mni_cohort_lookup_clear_btn,
+            self.mni_cohort_export_btn, self.publication_image_btn,
+            self.mni_cohort_lookup_filter_checkbox, self.mni_cohort_shared_scale_checkbox,
+            self.mni_cohort_lookup_status_label, self.mni_cohort_pool_checkbox,
+            self.mni_cohort_pool_spin, self.mni_cohort_smooth_checkbox,
+            self.mni_cohort_smooth_spin, self.brain_transparency_slider,
+            self.brain_transparency_value_label, self.shaft_transparency_slider,
+            self.shaft_transparency_value_label, self.coreg_status_label,
+            *self.surface_buttons.values(), *colors.values(),
+        ]
+        keep = {id(widget) for widget in widgets}
+
+        def empty(old_layout):
+            while old_layout.count():
+                item = old_layout.takeAt(0)
+                child_layout = item.layout()
+                widget = item.widget()
+                if child_layout is not None:
+                    empty(child_layout)
+                    child_layout.deleteLater()
+                elif widget is not None and id(widget) not in keep:
+                    widget.hide()
+                    widget.deleteLater()
+        empty(layout)
+        for widget in widgets:
+            widget.setParent(container)
+        layout.setSpacing(3)
+
+        def row(parent_layout, title=None):
+            line = QtWidgets.QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(7)
+            if title:
+                label = QtWidgets.QLabel(title)
+                label.setFixedWidth(55)
+                label.setStyleSheet("font-size: 11px; font-weight: bold; color: #555555;")
+                line.addWidget(label)
+            parent_layout.addLayout(line)
+            return line
+
+        self.mni_cohort_load_btn.setText("Reload locations…" if self.mni_cohort_active else "Load locations…")
+        self.mni_cohort_lookup_load_btn.setText("Load table…")
+        self.mni_cohort_clear_btn.setText("Clear locations")
+        self.mni_cohort_lookup_clear_btn.setText("Clear table")
+        self.mni_cohort_export_btn.setText("Export series…")
+        self.mni_cohort_lookup_filter_checkbox.setText("Table contacts only")
+        self.mni_cohort_pool_checkbox.setText("Merge nearby")
+        self.mni_cohort_smooth_checkbox.setText("Smooth field")
+        self.mni_cohort_color_combo.setMinimumContentsLength(16)
+        self.mni_cohort_color_combo.setMinimumWidth(140)
+        self.mni_cohort_pool_spin.setMaximumWidth(95)
+        self.mni_cohort_smooth_spin.setMaximumWidth(95)
+        self.brain_transparency_slider.setFixedWidth(100)
+        self.shaft_transparency_slider.setFixedWidth(100)
+
+        line = row(layout, "Data")
+        for widget in (self.coreg_toggle_btn, self.mni_cohort_load_btn,
+                       self.mni_cohort_lookup_load_btn, self.mni_cohort_patient_combo,
+                       self.mni_cohort_lookup_filter_checkbox):
+            line.addWidget(widget)
+        line.addStretch()
+        line.addWidget(self.mni_cohort_lookup_clear_btn)
+        line.addWidget(self.mni_cohort_clear_btn)
+
+        line = row(layout, "View")
+        line.addWidget(self.subject_view_combo)
+        line.addWidget(self.view_combo)
+        line.addSpacing(8)
+        for widget in self.surface_buttons.values():
+            line.addWidget(widget)
+        line.addWidget(self.mni_cohort_labels_checkbox)
+        line.addStretch()
+        line.addWidget(self.mni_cohort_export_btn)
+        line.addWidget(self.publication_image_btn)
+
+        line = row(layout, "Scalar")
+        line.addWidget(self.mni_cohort_color_combo, 1)
+        line.addSpacing(8)
+        line.addWidget(self.mni_cohort_pool_checkbox)
+        line.addWidget(QtWidgets.QLabel("Diameter:"))
+        line.addWidget(self.mni_cohort_pool_spin)
+        line.addSpacing(8)
+        line.addWidget(self.mni_cohort_smooth_checkbox)
+        line.addWidget(QtWidgets.QLabel("FWHM:"))
+        line.addWidget(self.mni_cohort_smooth_spin)
+
+        line = row(layout, "Range ±")
+        line.addWidget(colors["spin"])
+        line.addWidget(colors["slider"], 1)
+        line.addWidget(colors["robust"])
+        line.addWidget(colors["lock"])
+        self.display_details_button = QtWidgets.QToolButton()
+        self.display_details_button.setText("Display details")
+        self.display_details_button.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.display_details_button.setCheckable(True)
+        self.display_details_button.setChecked(self._display_details_expanded)
+        self.display_details_button.setArrowType(QtCore.Qt.DownArrow if self._display_details_expanded else QtCore.Qt.RightArrow)
+        self.display_details_button.setToolTip("Percentile, full-range reset, small-value enhancement, transparency and detailed status")
+        line.addWidget(self.display_details_button)
+
+        self.display_details_panel = QtWidgets.QWidget(container)
+        details_layout = QtWidgets.QVBoxLayout(self.display_details_panel)
+        details_layout.setContentsMargins(0, 2, 0, 2)
+        details_layout.setSpacing(3)
+        line = row(details_layout, "Contrast")
+        line.addWidget(QtWidgets.QLabel("Robust percentile:"))
+        line.addWidget(colors["percentile"])
+        line.addWidget(colors["full"])
+        line.addWidget(self.mni_cohort_shared_scale_checkbox)
+        line.addWidget(colors["enhance"])
+        line.addStretch()
+        line = row(details_layout, "Opacity")
+        line.addWidget(QtWidgets.QLabel("Brain transparency:"))
+        line.addWidget(self.brain_transparency_slider)
+        line.addWidget(self.brain_transparency_value_label)
+        line.addWidget(QtWidgets.QLabel("Shaft transparency:"))
+        line.addWidget(self.shaft_transparency_slider)
+        line.addWidget(self.shaft_transparency_value_label)
+        line.addWidget(QtWidgets.QLabel("Field visibility:"))
+        line.addWidget(colors["visibility"])
+        line.addStretch()
+        line = row(details_layout)
+        line.addWidget(colors["status"], 1)
+        line.addWidget(self.coreg_status_label)
+        layout.addWidget(self.display_details_panel)
+        self.display_details_panel.setVisible(self._display_details_expanded)
+        self.display_details_button.toggled.connect(self._toggle_display_details)
+
+        line = row(layout)
+        for widget in (self.mni_cohort_status_label, self.mni_cohort_lookup_status_label):
+            widget.setWordWrap(False)
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            line.addWidget(widget, 1)
+
+    def _toggle_display_details(self, expanded):
+        self._display_details_expanded = bool(expanded)
+        self.display_details_panel.setVisible(expanded)
+        self.display_details_button.setArrowType(QtCore.Qt.DownArrow if expanded else QtCore.Qt.RightArrow)
 
     def _sync_mni_cohort_controls(self):
         """Synchronize cohort controls after a load, filter, or panel rebuild."""
@@ -963,9 +1269,35 @@ class SEEGLocalizer:
             combo.addItem("All patients", None)
             for patient_id in patient_ids:
                 combo.addItem(str(patient_id), patient_id)
-            selected = self.mni_cohort_patient_filter
-            idx = combo.findData(selected)
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+            selected = self.mni_cohort_selected_patients
+            if selected is None:
+                selected = set(patient_ids)
+            else:
+                selected = set(selected).intersection(patient_ids)
+            self.mni_cohort_selected_patients = selected
+
+            for row in range(combo.count()):
+                item = combo.model().item(row)
+                if item is None:
+                    continue
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                if row == 0:
+                    if patient_ids and len(selected) == len(patient_ids):
+                        state = QtCore.Qt.Checked
+                    elif selected:
+                        state = QtCore.Qt.PartiallyChecked
+                    else:
+                        state = QtCore.Qt.Unchecked
+                else:
+                    state = (
+                        QtCore.Qt.Checked
+                        if combo.itemData(row) in selected
+                        else QtCore.Qt.Unchecked
+                    )
+                item.setCheckState(state)
+            self._update_mni_cohort_patient_combo_summary()
+            combo.setCurrentIndex(0)
             combo.setEnabled(bool(self.mni_cohort_active and patient_ids))
             combo.blockSignals(False)
 
@@ -973,35 +1305,697 @@ class SEEGLocalizer:
         if labels_checkbox is not None:
             labels_checkbox.blockSignals(True)
             labels_checkbox.setChecked(bool(self.mni_cohort_show_labels))
-            labels_checkbox.setEnabled(bool(self.mni_cohort_active))
+            labels_checkbox.setEnabled(True)
             labels_checkbox.blockSignals(False)
 
         load_btn = getattr(self, "mni_cohort_load_btn", None)
         if load_btn is not None:
             load_btn.setText(
-                "Reload Saved Locations..." if self.mni_cohort_active else "Load Saved Locations..."
+                "Reload locations…" if self.mni_cohort_active else "Load locations…"
             )
         clear_btn = getattr(self, "mni_cohort_clear_btn", None)
         if clear_btn is not None:
             clear_btn.setEnabled(bool(self.mni_cohort_active))
 
+        self._sync_mni_lookup_controls()
+        self._update_mni_cohort_status()
+
+    def _update_mni_cohort_patient_combo_summary(self):
+        """Show the current multi-patient selection in the closed combo box."""
+        combo = getattr(self, "mni_cohort_patient_combo", None)
+        if combo is None or combo.count() == 0:
+            return
+        patient_count = max(0, combo.count() - 1)
+        selected_count = sum(
+            combo.model().item(row).checkState() == QtCore.Qt.Checked
+            for row in range(1, combo.count())
+        )
+        if selected_count == patient_count:
+            text = "All patients"
+        elif selected_count == 0:
+            text = "No patients selected"
+        else:
+            text = f"{selected_count}/{patient_count} patients"
+        combo.setItemText(0, text)
+
+    def _update_mni_cohort_status(self):
+        """Update cohort counts for the currently checked patients."""
+        self._sync_mni_color_controls()
         status = getattr(self, "mni_cohort_status_label", None)
-        if status is not None:
-            if not self.mni_cohort_active:
-                status.setText("No cohort loaded")
+        if status is None:
+            return
+        if not self.mni_cohort_active:
+            status.setText("No cohort loaded")
+            return
+
+        summary = self.mni_cohort_summary or {}
+        patient_ids = set(summary.get("patient_ids", []) or [])
+        selected = self.mni_cohort_selected_patients
+        if selected is None:
+            selected = patient_ids
+        else:
+            selected = set(selected).intersection(patient_ids)
+        shown = self._mni_cohort_display_indices()
+        contact_count = len(shown)
+        if not selected:
+            status.setText("No patients selected")
+        elif len(selected) == 1:
+            patient_id = next(iter(selected))
+            status.setText(f"{patient_id}: {contact_count} contacts")
+        else:
+            status.setText(
+                f"{contact_count} contacts / {len(selected)} of {len(patient_ids)} patients"
+            )
+        if self.mni_cohort_scalar_column and self.mni_cohort_lookup:
+            missing = sum(not np.isfinite(self._mni_cohort_scalar_value(index)) for index in shown)
+            if self.mni_cohort_smooth_enabled:
+                stats = self._mni_cohort_smooth_summary
+                status.setText(status.text() + f" · smooth field {self.mni_cohort_smooth_fwhm:g} mm FWHM · "
+                               f"{stats.get('contributing_contacts', 0)} finite contacts · "
+                               f"{stats.get('covered_vertices', 0)} supported vertices")
+            elif self.mni_cohort_pool_enabled:
+                groups = self._mni_cohort_pooled_groups
+                gray = sum(group["mean"] is None for group in groups)
+                status.setText(status.text() + f" → {len(groups)} clusters · "
+                               f"{missing} missing values excluded from means · {gray} gray clusters")
             else:
-                patient_filter = self.mni_cohort_patient_filter
-                if patient_filter:
-                    count = sum(
-                        1 for electrode in self.mni_cohort_electrodes
-                        if electrode.get("cohort_patient") == patient_filter
-                    )
-                    status.setText(f"{patient_filter}: {count} contacts")
-                else:
-                    status.setText(
-                        f"{summary.get('contacts_loaded', 0)} contacts / "
-                        f"{summary.get('patients_loaded', 0)} patients"
-                    )
+                status.setText(status.text() + f" · {missing} without values (gray)")
+
+    def _create_mni_lookup_controls(self, layout):
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.mni_cohort_lookup_load_btn = QtWidgets.QPushButton("Load Lookup CSV...")
+        self.mni_cohort_lookup_load_btn.setToolTip(
+            "Load subject/electrode_name keys and numeric values for individual contacts"
+        )
+        self.mni_cohort_lookup_load_btn.clicked.connect(self._browse_mni_cohort_lookup)
+        row.addWidget(self.mni_cohort_lookup_load_btn)
+        row.addWidget(QtWidgets.QLabel("Colors:"))
+        self.mni_cohort_color_combo = QtWidgets.QComboBox()
+        self.mni_cohort_color_combo.setMinimumContentsLength(24)
+        self.mni_cohort_color_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.mni_cohort_color_combo.currentIndexChanged.connect(self._on_mni_lookup_color_changed)
+        row.addWidget(self.mni_cohort_color_combo, 1)
+        self.mni_cohort_lookup_clear_btn = QtWidgets.QPushButton("Clear Lookup")
+        self.mni_cohort_lookup_clear_btn.clicked.connect(self.clear_mni_cohort_lookup)
+        row.addWidget(self.mni_cohort_lookup_clear_btn)
+        self.mni_cohort_export_btn = QtWidgets.QPushButton("Export Figures...")
+        self.mni_cohort_export_btn.setToolTip(
+            "Save separate L1/L2/L3 PNGs (or the selected scalar column) from this camera, "
+            "plus a JSON record of the figure settings"
+        )
+        self.mni_cohort_export_btn.clicked.connect(self._browse_export_mni_cohort_figures)
+        row.addWidget(self.mni_cohort_export_btn)
+        self.publication_image_btn = QtWidgets.QPushButton("Save Publication Image...")
+        self.publication_image_btn.setToolTip(
+            "Save this view as a lossless PNG or TIFF: 4200 pixels on the longest edge, "
+            "600 DPI (7 inches), white background, current legend/labels, and a settings sidecar."
+        )
+        self.publication_image_btn.clicked.connect(self._browse_save_publication_image)
+        row.addWidget(self.publication_image_btn)
+        layout.addLayout(row)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.mni_cohort_lookup_filter_checkbox = QtWidgets.QCheckBox("Only table electrodes")
+        self.mni_cohort_lookup_filter_checkbox.setToolTip(
+            "Show only contacts uniquely matched to the lookup table, even with default colors"
+        )
+        self.mni_cohort_lookup_filter_checkbox.toggled.connect(self._on_mni_lookup_filter_changed)
+        row.addWidget(self.mni_cohort_lookup_filter_checkbox)
+        self.mni_cohort_shared_scale_checkbox = QtWidgets.QCheckBox("Shared L1/L2/L3 auto-range")
+        self.mni_cohort_shared_scale_checkbox.setToolTip(
+            "Use identical zero-centered color limits for the three lesion measures. "
+            "Limits use all matched cohort contacts and stay fixed when patients are unchecked. "
+            "Manual ranges are per column unless Lock across columns is enabled."
+        )
+        self.mni_cohort_shared_scale_checkbox.toggled.connect(self._on_mni_lookup_scale_changed)
+        row.addWidget(self.mni_cohort_shared_scale_checkbox)
+        self.mni_cohort_lookup_status_label = QtWidgets.QLabel("No lookup table")
+        self.mni_cohort_lookup_status_label.setWordWrap(True)
+        row.addWidget(self.mni_cohort_lookup_status_label, 1)
+        layout.addLayout(row)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.mni_cohort_pool_checkbox = QtWidgets.QCheckBox("Merge nearby")
+        self.mni_cohort_pool_checkbox.setToolTip(
+            "Spatial pooling of visible MNI contacts. Color is the arithmetic mean "
+            "of available contact values; this is descriptive, not statistical ALE."
+        )
+        self.mni_cohort_pool_checkbox.toggled.connect(self._on_mni_pool_changed)
+        row.addWidget(self.mni_cohort_pool_checkbox)
+        row.addWidget(QtWidgets.QLabel("Maximum cluster diameter:"))
+        self.mni_cohort_pool_spin = QtWidgets.QDoubleSpinBox()
+        self.mni_cohort_pool_spin.setRange(0.1, 50.0)
+        self.mni_cohort_pool_spin.setSuffix(" mm")
+        self.mni_cohort_pool_spin.setDecimals(1)
+        self.mni_cohort_pool_spin.setKeyboardTracking(False)
+        self.mni_cohort_pool_spin.setToolTip(
+            "Every pair in a cluster stays within this MNI distance. "
+            "10 mm is an adjustable starting value, not an estimated optimum."
+        )
+        self.mni_cohort_pool_spin.valueChanged.connect(self._on_mni_pool_diameter_changed)
+        row.addWidget(self.mni_cohort_pool_spin)
+        row.addStretch()
+        layout.addLayout(row)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.mni_cohort_smooth_checkbox = QtWidgets.QCheckBox("Smooth scalar field")
+        self.mni_cohort_smooth_checkbox.setToolTip(
+            "Blend finite contact values with Gaussian weights along the cortical mesh. "
+            "Color is a weighted mean; fading indicates distance from sampled sites, not confidence. "
+            "Turn off both Smooth scalar field and Merge nearby to show individual contacts."
+        )
+        self.mni_cohort_smooth_checkbox.toggled.connect(self._on_mni_smooth_changed)
+        row.addWidget(self.mni_cohort_smooth_checkbox)
+        row.addWidget(QtWidgets.QLabel("Smoothing width (FWHM):"))
+        self.mni_cohort_smooth_spin = QtWidgets.QDoubleSpinBox()
+        self.mni_cohort_smooth_spin.setRange(2.0, 50.0)
+        self.mni_cohort_smooth_spin.setDecimals(1)
+        self.mni_cohort_smooth_spin.setSuffix(" mm")
+        self.mni_cohort_smooth_spin.setKeyboardTracking(False)
+        self.mni_cohort_smooth_spin.setToolTip(
+            "Gaussian full width at half maximum along the original white surface. "
+            "15 mm is a starting value, not a fitted optimum. Larger values blend more broadly."
+        )
+        self.mni_cohort_smooth_spin.valueChanged.connect(self._on_mni_smooth_width_changed)
+        row.addWidget(self.mni_cohort_smooth_spin)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self._create_mni_color_controls(layout)
+
+    def _create_mni_color_controls(self, layout):
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QtWidgets.QLabel("Color range ±"))
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setDecimals(12)
+        spin.setRange(0.000000000001, 1e12)
+        spin.setKeyboardTracking(False)
+        spin.setMaximumWidth(170)
+        spin.setToolTip("Symmetric limits in scalar units. Values outside the range saturate at the endpoint colors.")
+        spin.valueChanged.connect(self._on_mni_color_limit_changed)
+        row.addWidget(spin)
+        slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        slider.setRange(0, 1000)
+        slider.setTracking(False)
+        slider.setMinimumWidth(130)
+        slider.setToolTip("Narrow the color range from the full data range down to 0.1%, on a logarithmic slider.")
+        slider.valueChanged.connect(self._on_mni_color_slider_changed)
+        row.addWidget(slider)
+        robust = QtWidgets.QPushButton("Robust auto-range")
+        robust.clicked.connect(lambda: self._set_mni_color_auto_mode("robust"))
+        row.addWidget(robust)
+        percentile = QtWidgets.QDoubleSpinBox()
+        percentile.setRange(50, 100)
+        percentile.setDecimals(1)
+        percentile.setSuffix("%")
+        percentile.setToolTip("Percentile of absolute finite matched values. Patient filters do not change this reference.")
+        percentile.valueChanged.connect(self._on_mni_color_percentile_changed)
+        row.addWidget(percentile)
+        full = QtWidgets.QPushButton("Full range")
+        full.clicked.connect(lambda: self._set_mni_color_auto_mode("full"))
+        row.addWidget(full)
+        lock = QtWidgets.QCheckBox("Lock across columns")
+        lock.setToolTip("Hold the current numeric limits across all scalar columns and exports. Range edits update the locked value.")
+        lock.toggled.connect(self._on_mni_color_lock_changed)
+        row.addWidget(lock)
+        layout.addLayout(row)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        enhance = QtWidgets.QCheckBox("Enhance small values (asinh)")
+        enhance.setToolTip("Expand colors near zero with an asinh curve. Data and legend labels stay in original scalar units.")
+        enhance.toggled.connect(self._on_mni_color_enhance_changed)
+        row.addWidget(enhance)
+        row.addWidget(QtWidgets.QLabel("Field visibility:"))
+        visibility = QtWidgets.QSpinBox()
+        visibility.setRange(0, 300)
+        visibility.setSuffix("%")
+        visibility.setKeyboardTracking(False)
+        visibility.setMaximumWidth(100)
+        visibility.setToolTip("Scale smooth-field opacity independently of values and blur width; 100% is the original fade.")
+        visibility.valueChanged.connect(self._on_mni_field_visibility_changed)
+        row.addWidget(visibility)
+        status = QtWidgets.QLabel()
+        status.setWordWrap(True)
+        row.addWidget(status, 1)
+        layout.addLayout(row)
+        self.mni_color_controls = dict(spin=spin, slider=slider, robust=robust, percentile=percentile,
+                                       full=full, lock=lock, enhance=enhance, visibility=visibility,
+                                       status=status)
+
+    def _sync_mni_lookup_controls(self):
+        lookup = self.mni_cohort_lookup
+        available = bool(self.mni_cohort_active and lookup and self.mni_cohort_scalar_column)
+        if self.mni_cohort_labels_checkbox is not None:
+            self.mni_cohort_labels_checkbox.setEnabled(
+                not (available and self.mni_cohort_smooth_enabled)
+            )
+        if self.mni_cohort_smooth_checkbox is not None:
+            self.mni_cohort_smooth_checkbox.blockSignals(True)
+            self.mni_cohort_smooth_checkbox.setChecked(self.mni_cohort_smooth_enabled)
+            self.mni_cohort_smooth_checkbox.setEnabled(available)
+            self.mni_cohort_smooth_checkbox.blockSignals(False)
+        if self.mni_cohort_smooth_spin is not None:
+            self.mni_cohort_smooth_spin.blockSignals(True)
+            self.mni_cohort_smooth_spin.setValue(self.mni_cohort_smooth_fwhm)
+            self.mni_cohort_smooth_spin.setEnabled(available and self.mni_cohort_smooth_enabled)
+            self.mni_cohort_smooth_spin.blockSignals(False)
+        if self.mni_cohort_pool_checkbox is not None:
+            self.mni_cohort_pool_checkbox.blockSignals(True)
+            self.mni_cohort_pool_checkbox.setChecked(self.mni_cohort_pool_enabled)
+            self.mni_cohort_pool_checkbox.setEnabled(available)
+            self.mni_cohort_pool_checkbox.blockSignals(False)
+        if self.mni_cohort_pool_spin is not None:
+            self.mni_cohort_pool_spin.blockSignals(True)
+            self.mni_cohort_pool_spin.setValue(self.mni_cohort_pool_diameter)
+            self.mni_cohort_pool_spin.setEnabled(available and self.mni_cohort_pool_enabled)
+            self.mni_cohort_pool_spin.blockSignals(False)
+        combo = self.mni_cohort_color_combo
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Default location colors", None)
+            if lookup:
+                for column in lookup.columns:
+                    combo.addItem(column, column)
+                    combo.setItemData(combo.count() - 1, column, QtCore.Qt.ToolTipRole)
+            combo.setCurrentIndex(max(0, combo.findData(self.mni_cohort_scalar_column)))
+            combo.setEnabled(bool(lookup))
+            combo.setToolTip(self.mni_cohort_scalar_column or "Default location colors")
+            combo.blockSignals(False)
+        for checkbox, value, enabled in (
+            (self.mni_cohort_lookup_filter_checkbox, self.mni_cohort_lookup_filter, bool(lookup)),
+            (self.mni_cohort_shared_scale_checkbox, self.mni_cohort_shared_scale,
+             bool(lookup and any(column in lookup.columns for column in LESION_COLUMNS))),
+        ):
+            if checkbox is not None:
+                checkbox.blockSignals(True)
+                checkbox.setChecked(value)
+                checkbox.setEnabled(enabled)
+                checkbox.blockSignals(False)
+        if self.mni_cohort_lookup_clear_btn is not None:
+            self.mni_cohort_lookup_clear_btn.setEnabled(bool(lookup))
+        if self.mni_cohort_export_btn is not None:
+            self.mni_cohort_export_btn.setEnabled(bool(
+                self.mni_cohort_active and lookup and self.mni_cohort_scalar_column
+            ))
+        if self.publication_image_btn is not None:
+            self.publication_image_btn.setEnabled(self.brain is not None and hasattr(self.brain, "_renderer"))
+        status = self.mni_cohort_lookup_status_label
+        if status is not None:
+            if lookup is None:
+                status.setText("No lookup table")
+                status.setToolTip("")
+            elif not self.mni_cohort_active:
+                status.setText(f"{len(lookup.rows)} lookup rows · load a cohort to match")
+                status.setToolTip(str(lookup.path))
+            else:
+                matches = self.mni_cohort_lookup_matches
+                status.setText(
+                    f"{matches.matched_contacts}/{len(self.mni_cohort_electrodes)} contacts matched · "
+                    f"{len(matches.unmatched_rows)} table rows unmatched · "
+                    f"{len(matches.ambiguous_contacts)} ambiguous contacts"
+                )
+                sample = "\n".join(
+                    f"{lookup.rows[index]['subject']} / {lookup.rows[index]['electrode_name']}"
+                    for index in matches.unmatched_rows[:10]
+                )
+                status.setToolTip(f"{lookup.path}\nUnmatched table rows (up to 10):\n{sample}")
+
+        self._sync_mni_color_controls()
+
+    def _sync_mni_color_controls(self):
+        controls = self.mni_color_controls
+        if not controls:
+            return
+        available = bool(self.mni_cohort_active and self.mni_cohort_lookup and self.mni_cohort_scalar_column)
+        limit = self._mni_cohort_scalar_limits()[1] if available else 1.0
+        full = self._mni_auto_color_limit(100) if available else 1.0
+        slider_value = int(round(1000 * (1 + np.log10(max(limit / full, 0.001)) / 3)))
+        values = {"spin": limit, "slider": min(1000, max(0, slider_value)),
+                  "percentile": self.mni_color_percentile, "lock": self.mni_color_locked_limit is not None,
+                  "enhance": self.mni_color_enhance, "visibility": int(round(100 * self.mni_field_visibility))}
+        for name, value in values.items():
+            widget = controls[name]
+            widget.blockSignals(True)
+            if name in ("lock", "enhance"):
+                widget.setChecked(value)
+            else:
+                widget.setValue(value)
+            widget.setEnabled(available and (name != "visibility" or self.mni_cohort_smooth_enabled))
+            widget.blockSignals(False)
+        controls["robust"].setEnabled(available)
+        controls["full"].setEnabled(available)
+        if available:
+            samples = np.asarray([self._mni_cohort_scalar_value(i) for i in self._mni_cohort_display_indices()])
+            clipped = int(np.count_nonzero(np.isfinite(samples) & (np.abs(samples) > limit)))
+            mode = "locked" if self.mni_color_locked_limit is not None else (
+                "manual" if self.mni_cohort_scalar_column in self.mni_color_manual_limits else self.mni_color_auto_mode)
+            controls["status"].setText(f"{mode} · ±{limit:.4g} · {clipped} visible contact values outside range (saturated)")
+        else:
+            controls["status"].setText("Select a scalar column to adjust contrast")
+
+    def _refresh_mni_color_display(self):
+        self._display_mni_cohort_electrodes()
+        self._sync_mni_color_controls()
+        self._update_mni_cohort_status()
+
+    def _on_mni_color_limit_changed(self, value):
+        if not self.mni_cohort_scalar_column or value <= 0:
+            return
+        self.mni_color_manual_limits[self.mni_cohort_scalar_column] = float(value)
+        if self.mni_color_locked_limit is not None:
+            self.mni_color_locked_limit = float(value)
+        self._refresh_mni_color_display()
+
+    def _on_mni_color_slider_changed(self, value):
+        self._on_mni_color_limit_changed(self._mni_auto_color_limit(100) * 10 ** (3 * (value / 1000 - 1)))
+
+    def _set_mni_color_auto_mode(self, mode):
+        self.mni_color_auto_mode = mode
+        self.mni_color_manual_limits.pop(self.mni_cohort_scalar_column, None)
+        if self.mni_color_locked_limit is not None:
+            self.mni_color_locked_limit = self._mni_auto_color_limit(
+                self.mni_color_percentile if mode == "robust" else 100)
+        self._refresh_mni_color_display()
+
+    def _on_mni_color_percentile_changed(self, value):
+        self.mni_color_percentile = float(value)
+        if self.mni_color_auto_mode == "robust":
+            self._set_mni_color_auto_mode("robust")
+
+    def _on_mni_color_lock_changed(self, checked):
+        self.mni_color_locked_limit = self._mni_cohort_scalar_limits()[1] if checked else None
+        self._refresh_mni_color_display()
+
+    def _on_mni_color_enhance_changed(self, checked):
+        self.mni_color_enhance = bool(checked)
+        self._refresh_mni_color_display()
+
+    def _on_mni_field_visibility_changed(self, value):
+        self.mni_field_visibility = value / 100.0
+        self._refresh_mni_color_display()
+
+    def _match_mni_cohort_lookup(self):
+        self.mni_cohort_lookup_matches = (
+            match_cohort_lookup(self.mni_cohort_electrodes, self.mni_cohort_lookup)
+            if self.mni_cohort_lookup else None
+        )
+
+    def load_mni_cohort_lookup(self, path):
+        """Load transactionally so a malformed replacement keeps the existing view."""
+        lookup = load_cohort_lookup(path)
+        matches = match_cohort_lookup(self.mni_cohort_electrodes, lookup)
+        self.mni_cohort_lookup = lookup
+        self.mni_color_manual_limits = {}
+        self.mni_color_locked_limit = None
+        self.mni_cohort_lookup_matches = matches
+        self.mni_cohort_scalar_column = lookup.columns[0]
+        self.mni_cohort_lookup_filter = True
+        self._display_mni_cohort_electrodes()
+        self._sync_mni_cohort_controls()
+        return matches
+
+    def _browse_mni_cohort_lookup(self):
+        start = str(self.mni_cohort_lookup.path) if self.mni_cohort_lookup else str(Path.home())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None, "Select Electrode Scalar Lookup Table", start, "CSV files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            matches = self.load_mni_cohort_lookup(path)
+        except (OSError, ValueError) as exc:
+            QtWidgets.QMessageBox.warning(None, "Cannot Load Lookup", str(exc))
+            return
+        if self.mni_cohort_active and matches.matched_contacts == 0:
+            QtWidgets.QMessageBox.warning(
+                None, "No Matching Contacts",
+                "No contacts matched uniquely. Subjects come from the saved CSV's subject folder "
+                "(SUBJ_009 matches SUBJ09); no subject column is needed in that saved CSV. "
+                "The final underscore-separated part of electrode_name is matched to the saved "
+                "name or map_contact (ns5_1_LAMY01 matches LAMY01). Contact zero padding is "
+                "handled automatically.\n\n"
+                "Uncheck 'Only table electrodes' to see the cohort while checking the names."
+            )
+
+    def clear_mni_cohort_lookup(self):
+        self.mni_cohort_lookup = None
+        self.mni_color_manual_limits = {}
+        self.mni_color_locked_limit = None
+        self.mni_cohort_lookup_matches = None
+        self.mni_cohort_scalar_column = None
+        self.mni_cohort_lookup_filter = False
+        self._display_mni_cohort_electrodes()
+        self._sync_mni_cohort_controls()
+
+    def _on_mni_lookup_color_changed(self, index):
+        self.mni_cohort_scalar_column = self.mni_cohort_color_combo.itemData(index)
+        self._display_mni_cohort_electrodes()
+        self._sync_mni_lookup_controls()
+        self._update_mni_cohort_status()
+
+    def _on_mni_lookup_filter_changed(self, checked):
+        self.mni_cohort_lookup_filter = bool(checked)
+        self._display_mni_cohort_electrodes()
+        self._update_mni_cohort_status()
+
+    def _on_mni_lookup_scale_changed(self, checked):
+        self.mni_cohort_shared_scale = bool(checked)
+        self._refresh_mni_color_display()
+
+    def _on_mni_pool_changed(self, checked):
+        self.mni_cohort_pool_enabled = bool(checked)
+        if checked:
+            self.mni_cohort_smooth_enabled = False
+        self._display_mni_cohort_electrodes()
+        self._sync_mni_cohort_controls()
+
+    def _on_mni_smooth_changed(self, checked):
+        self.mni_cohort_smooth_enabled = bool(checked)
+        if checked:
+            self.mni_cohort_pool_enabled = False
+        self._display_mni_cohort_electrodes()
+        self._sync_mni_cohort_controls()
+
+    def _on_mni_smooth_width_changed(self, value):
+        self.mni_cohort_smooth_fwhm = float(value)
+        self._display_mni_cohort_electrodes()
+        self._update_mni_cohort_status()
+
+    def _on_mni_pool_diameter_changed(self, value):
+        self.mni_cohort_pool_diameter = float(value)
+        self._display_mni_cohort_electrodes()
+        self._update_mni_cohort_status()
+
+    def _mni_cohort_display_indices(self):
+        matches = self.mni_cohort_lookup_matches
+        return [
+            index for index, electrode in enumerate(self.mni_cohort_electrodes)
+            if cohort_contact_is_visible(electrode, self.mni_cohort_selected_patients)
+            and (not self.mni_cohort_lookup_filter or matches is None
+                 or matches.row_indices[index] is not None)
+        ]
+
+    def _mni_cohort_scalar_value(self, index):
+        if not self.mni_cohort_lookup or not self.mni_cohort_scalar_column:
+            return np.nan
+        row = self.mni_cohort_lookup_matches.row_indices[index]
+        if row is None:
+            return np.nan
+        return self.mni_cohort_lookup.values[self.mni_cohort_scalar_column][row]
+
+    def _mni_auto_color_limit(self, percentile):
+        column = self.mni_cohort_scalar_column
+        if not self.mni_cohort_lookup or not column or not self.mni_cohort_lookup_matches:
+            return 1.0
+        columns = [column]
+        if self.mni_cohort_shared_scale and column in LESION_COLUMNS:
+            columns = [name for name in LESION_COLUMNS if name in self.mni_cohort_lookup.columns]
+        rows = {index for index in self.mni_cohort_lookup_matches.row_indices if index is not None}
+        values = [self.mni_cohort_lookup.values[name][index] for name in columns for index in rows]
+        return symmetric_color_limit(values, percentile)
+
+    def _mni_cohort_scalar_limits(self):
+        limit = self.mni_color_locked_limit
+        if limit is None:
+            limit = self.mni_color_manual_limits.get(self.mni_cohort_scalar_column)
+        if limit is None:
+            limit = self._mni_auto_color_limit(self.mni_color_percentile if self.mni_color_auto_mode == "robust" else 100)
+        return (-limit, limit)
+
+    def _mni_figure_settings(self):
+        """Snapshot common display settings for single-image and batch exports."""
+        plotter = self.brain._renderer.plotter
+        camera = plotter.camera
+        lookup = self.mni_cohort_lookup
+        matches = self.mni_cohort_lookup_matches
+        return {
+            "lookup_csv": str(lookup.path) if lookup else None, "cohort_root": self.mni_cohort_root,
+            "selected_patients": (sorted(self.mni_cohort_selected_patients)
+                                  if self.mni_cohort_selected_patients is not None else None),
+            "only_table_electrodes": self.mni_cohort_lookup_filter,
+            "shared_l1_l2_l3_scale": self.mni_cohort_shared_scale,
+            "smooth_scalar_field": self.mni_cohort_smooth_enabled,
+            "smoothing_fwhm_mm": self.mni_cohort_smooth_fwhm,
+            "smoothing_method": "Gaussian weighted contact mean on white mesh-edge distances",
+            "smoothing_projection": "nearest white vertex, separately per hemisphere",
+            "smoothing_cutoff_sigma": 3.0,
+            "smoothing_opacity": "strongest finite-contact kernel, tapered to zero at cutoff; not confidence",
+            "spatial_pooling": self.mni_cohort_pool_enabled,
+            "pooling_method": "complete linkage; equal contact mean; finite values only",
+            "maximum_cluster_diameter_mm": self.mni_cohort_pool_diameter,
+            "colormap": "RdBu_r_asinh10" if self.mni_color_enhance else "RdBu_r",
+            "color_auto_mode": self.mni_color_auto_mode,
+            "robust_percentile": self.mni_color_percentile,
+            "manual_color_limits": dict(self.mni_color_manual_limits),
+            "locked_color_limit": self.mni_color_locked_limit,
+            "color_enhancement": "asinh(10*x/limit)/asinh(10)" if self.mni_color_enhance else "linear",
+            "field_visibility_gain": self.mni_field_visibility,
+            "out_of_range_values": "saturate at endpoint colors; source values unchanged",
+            "missing_value_color": "#808080",
+            "surface": self.brain_surface, "brain_opacity": self.brain_opacity,
+            "shaft_opacity": self.shaft_opacity,
+            "labels": self.mni_cohort_show_labels,
+            "camera_position": [list(point) for point in plotter.camera_position],
+            "parallel_projection": bool(camera.parallel_projection),
+            "parallel_scale": float(camera.parallel_scale),
+            "matched_contacts": matches.matched_contacts if matches else 0,
+            "unmatched_table_rows": len(matches.unmatched_rows) if matches else 0,
+            "ambiguous_contacts": len(matches.ambiguous_contacts) if matches else 0,
+            "figures": [],
+        }
+
+    def _browse_save_publication_image(self):
+        stem = self.mni_cohort_scalar_column or "brain"
+        stem = re.sub(r"[^A-Za-z0-9_-]", "_", stem)
+        path, selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            None, "Save Publication Image — 4200 px, 600 DPI",
+            str(Path.home() / f"{self.brain_surface}_{stem}.png"),
+            "PNG image (*.png);;TIFF image (*.tif *.tiff)",
+        )
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".tif" if selected_filter.startswith("TIFF") else ".png"
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            image_path, settings_path = self.export_publication_image(path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(None, "Publication Image Could Not Be Saved", str(exc))
+        else:
+            QtWidgets.QMessageBox.information(
+                None, "Publication Image Saved",
+                f"Saved {image_path.name} at 600 DPI (4200-pixel longest edge).\n\n"
+                f"Image: {image_path}\nSettings: {settings_path}",
+            )
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def export_publication_image(self, path, long_edge_px=4200, dpi=600):
+        """Save the currently selected view, without cycling through columns."""
+        if self.brain is None or not hasattr(self.brain, "_renderer"):
+            raise ValueError("The 3D viewer is not ready")
+        if self.mni_cohort_active:
+            if not self._mni_cohort_display_indices():
+                raise ValueError("No contacts are visible. Check the patient and lookup filters.")
+            if not self._display_mni_cohort_electrodes():
+                raise RuntimeError("Could not render the current cohort view")
+        settings = self._mni_figure_settings()
+        settings.pop("figures", None)
+        scalar_mode = bool(self.mni_cohort_active and self.mni_cohort_lookup and self.mni_cohort_scalar_column)
+        settings.update({
+            "cohort_active": self.mni_cohort_active,
+            "column": self.mni_cohort_scalar_column if scalar_mode else None,
+            "color_limits": list(self._mni_cohort_scalar_limits()) if scalar_mode else None,
+            "pooled_groups": self._mni_cohort_pooled_groups if self.mni_cohort_active else [],
+            "smooth_field": self._mni_cohort_smooth_summary if self.mni_cohort_active else {},
+            "visible_contacts": len(self._mni_cohort_display_indices()) if self.mni_cohort_active else None,
+            "orientation_marker": bool(getattr(self._orientation_widget, "GetEnabled", lambda: False)()),
+        })
+        return save_publication_image(self.brain._renderer.plotter, path, settings,
+                                      long_edge_px=long_edge_px, dpi=dpi,
+                                      orientation_widget=self._orientation_widget)
+
+    def _browse_export_mni_cohort_figures(self):
+        directory = QtWidgets.QFileDialog.getExistingDirectory(None, "Save MNI Cohort Figures In")
+        if not directory:
+            return
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            paths = self.export_mni_cohort_figures(directory)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(None, "Figure Export Failed", str(exc))
+        else:
+            QtWidgets.QMessageBox.information(
+                None, "Figures Saved", f"Saved {len(paths)} figures and settings to:\n{paths[0].parent}"
+            )
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def export_mni_cohort_figures(self, directory):
+        """Save independent scalar figures with a fixed camera and restore the view."""
+        import json
+        import tempfile
+
+        if not self.mni_cohort_active or not self.mni_cohort_lookup or not self.mni_cohort_scalar_column:
+            raise ValueError("Load a cohort and lookup table, then select a scalar color column.")
+        if self.brain is None or not hasattr(self.brain, "_renderer"):
+            raise ValueError("The 3D viewer is not ready.")
+        shown = self._mni_cohort_display_indices()
+        if not shown:
+            raise ValueError("No contacts are visible. Check the patient and lookup filters.")
+        lookup = self.mni_cohort_lookup
+        previous_column = self.mni_cohort_scalar_column
+        columns = [previous_column]
+        if previous_column in LESION_COLUMNS:
+            columns = [column for column in LESION_COLUMNS if column in lookup.columns]
+        matched_rows = [self.mni_cohort_lookup_matches.row_indices[index] for index in shown]
+        if not any(np.isfinite(lookup.values[column][row])
+                   for column in columns for row in matched_rows if row is not None):
+            raise ValueError("The visible contacts have no finite values for the selected figures.")
+        output = Path(tempfile.mkdtemp(prefix="mni-cohort-figures-", dir=directory))
+        plotter = self.brain._renderer.plotter
+        camera = plotter.camera.copy()
+        paths = []
+        settings = self._mni_figure_settings()
+        try:
+            for column in columns:
+                self.mni_cohort_scalar_column = column
+                plotter.camera = camera.copy()
+                if not self._display_mni_cohort_electrodes():
+                    raise RuntimeError(f"Could not render {column}.")
+                filename = "mni_" + re.sub(r"[^A-Za-z0-9_-]", "_", column) + ".png"
+                path = output / filename
+                plotter.screenshot(str(path), scale=2, transparent_background=False, return_img=False)
+                paths.append(path)
+                settings["figures"].append({
+                    "file": filename, "column": column,
+                    "color_limits": list(self._mni_cohort_scalar_limits()),
+                    "visible_contacts": len(shown),
+                    "contacts_outside_color_range": sum(int(np.isfinite(self._mni_cohort_scalar_value(i)) and
+                        abs(self._mni_cohort_scalar_value(i)) > self._mni_cohort_scalar_limits()[1]) for i in shown),
+                    "pooled_groups": self._mni_cohort_pooled_groups,
+                    "smooth_field": self._mni_cohort_smooth_summary,
+                    "contacts_with_values": sum(int(np.isfinite(self._mni_cohort_scalar_value(index)))
+                                                for index in shown),
+                })
+            with (output / "figure_settings.json").open("w", encoding="utf-8") as handle:
+                json.dump(settings, handle, indent=2)
+        except Exception as exc:
+            raise RuntimeError(f"Export stopped; any completed files are in {output}.\n{exc}") from exc
+        finally:
+            self.mni_cohort_scalar_column = previous_column
+            plotter.camera = camera
+            self._display_mni_cohort_electrodes()
+            self._sync_mni_cohort_controls()
+        return paths
 
     def _browse_mni_cohort_directory(self):
         """Prompt for a cohort root and load saved MNI coordinate CSVs beneath it."""
@@ -1062,7 +2056,8 @@ class SEEGLocalizer:
         self.mni_cohort_summary = summary
         self.mni_cohort_root = str(cohort_root)
         self.mni_cohort_active = True
-        self.mni_cohort_patient_filter = None
+        self.mni_cohort_selected_patients = None
+        self._match_mni_cohort_lookup()
 
         subject_id, _ = self._get_brain_subject_info()
         if subject_id != "fsaverage":
@@ -1080,13 +2075,49 @@ class SEEGLocalizer:
             )
         return summary
 
-    def _on_mni_cohort_patient_changed(self, _index):
+    def _on_mni_cohort_patient_pressed(self, index):
+        """Toggle one patient, or all patients, in the cohort display."""
         combo = getattr(self, "mni_cohort_patient_combo", None)
         if combo is None or not self.mni_cohort_active:
             return
-        self.mni_cohort_patient_filter = combo.currentData()
+
+        row = index.row()
+        if row < 0 or row >= combo.count():
+            return
+        if row == 0:
+            all_checked = all(
+                combo.model().item(item_row).checkState() == QtCore.Qt.Checked
+                for item_row in range(1, combo.count())
+            )
+            state = QtCore.Qt.Unchecked if all_checked else QtCore.Qt.Checked
+            for item_row in range(1, combo.count()):
+                combo.model().item(item_row).setCheckState(state)
+        else:
+            item = combo.model().item(row)
+            state = (
+                QtCore.Qt.Unchecked
+                if item.checkState() == QtCore.Qt.Checked
+                else QtCore.Qt.Checked
+            )
+            item.setCheckState(state)
+
+        selected = {
+            combo.itemData(item_row)
+            for item_row in range(1, combo.count())
+            if combo.model().item(item_row).checkState() == QtCore.Qt.Checked
+        }
+        self.mni_cohort_selected_patients = selected
+        all_item = combo.model().item(0)
+        if selected and len(selected) == combo.count() - 1:
+            all_item.setCheckState(QtCore.Qt.Checked)
+        elif selected:
+            all_item.setCheckState(QtCore.Qt.PartiallyChecked)
+        else:
+            all_item.setCheckState(QtCore.Qt.Unchecked)
+        self._update_mni_cohort_patient_combo_summary()
+        combo.setCurrentIndex(0)
         self._display_mni_cohort_electrodes()
-        self._sync_mni_cohort_controls()
+        self._update_mni_cohort_status()
 
     @staticmethod
     def _mni_cohort_location_key(electrode):
@@ -1202,7 +2233,7 @@ class SEEGLocalizer:
             self._detected_shaft_label_actors.append(actor)
 
     def _on_mni_cohort_labels_changed(self, state):
-        """Show or hide cohort labels without rebuilding electrode meshes."""
+        """Show or hide 3D electrode labels without rebuilding electrode meshes."""
         self.mni_cohort_show_labels = bool(state == QtCore.Qt.Checked)
         self._refresh_mni_cohort_label_actors()
         self._sync_mni_cohort_controls()
@@ -1210,6 +2241,10 @@ class SEEGLocalizer:
     def _refresh_mni_cohort_label_actors(self):
         """Recreate label actors for the current camera without touching meshes."""
         if not self.mni_cohort_active:
+            for actor in getattr(self, "_detected_shaft_label_actors", []):
+                actor.SetVisibility(bool(self.mni_cohort_show_labels))
+            if self.brain is not None and hasattr(self.brain, "_renderer"):
+                self._render_plotter(self.brain._renderer.plotter)
             return
         if self.brain is None or not hasattr(self.brain, "_renderer"):
             return
@@ -1227,25 +2262,96 @@ class SEEGLocalizer:
                 print(f"Could not show MNI cohort labels: {exc}")
         self._render_plotter(plotter)
 
+    def _display_mni_smooth_field(self, plotter, indices):
+        """Display a continuous cortical field with distance-based opacity."""
+        import pyvista as pv
+
+        self._mni_cohort_pooled_groups = []
+        self._mni_cohort_label_positions = []
+        self._mni_cohort_label_texts = []
+        self._mni_cohort_label_sides = []
+        stats = {"contributing_contacts": 0, "covered_vertices": 0, "hemispheres": {}}
+        self._mni_cohort_smooth_summary = stats
+        finite_indices = [index for index in indices if np.isfinite(self._mni_cohort_scalar_value(index))]
+        if not finite_indices:
+            self._render_plotter(plotter)
+            return True
+        points = np.asarray([[self.mni_cohort_electrodes[index][key]
+                              for key in ("mni_x", "mni_y", "mni_z")]
+                             for index in finite_indices], dtype=float)
+        valid = np.all(np.isfinite(points), axis=1)
+        values = np.asarray([self._mni_cohort_scalar_value(index) for index in finite_indices])[valid]
+        points = points[valid]
+        subject, subjects_dir = self._get_brain_subject_info()
+        geometry = getattr(self.brain, "geo", {})
+        title = ("Smooth mean (asinh colors) · " if self.mni_color_enhance else "Smooth mean · ") + self.mni_cohort_scalar_column.replace("_baseline_minus_", "\nbaseline_minus_")
+        for hemi in ("lh", "rh"):
+            selected = points[:, 0] <= 0 if hemi == "lh" else points[:, 0] > 0
+            if not np.any(selected):
+                continue
+            geo = geometry.get(hemi)
+            if geo is None:
+                raise ValueError(f"No displayed {hemi} cortical geometry for smoothing")
+            key = (str(subjects_dir), subject, hemi)
+            if key not in self._mni_cohort_smooth_geometry:
+                white, faces = mne.surface.read_surface(
+                    str(Path(subjects_dir) / subject / "surf" / f"{hemi}.white")
+                )
+                self._mni_cohort_smooth_geometry[key] = CorticalGaussianField(white, faces)
+            field = self._mni_cohort_smooth_geometry[key]
+            if len(field.vertices) != len(geo.coords):
+                raise ValueError("Displayed and white surface vertex counts differ")
+            means, opacity = field.evaluate(points[selected], values[selected], self.mni_cohort_smooth_fwhm)
+            retained = np.unique(geo.faces)
+            covered = int(np.count_nonzero(opacity[retained] > 0))
+            stats["contributing_contacts"] += int(selected.sum())
+            stats["covered_vertices"] += covered
+            stats["hemispheres"][hemi] = {"contacts": int(selected.sum()), "covered_vertices": covered}
+            if not covered:
+                continue
+            # Lift the overlay very slightly to avoid coincident-surface flicker.
+            normals = np.asarray(geo.nn)
+            coords = np.asarray(geo.coords) + 0.15 * normals
+            faces = np.column_stack([np.full(len(geo.faces), 3), geo.faces]).ravel()
+            mesh = pv.PolyData(coords, faces)
+            mesh.point_data["cohort_scalar"] = means
+            mesh.point_data["field_opacity"] = np.clip(opacity * self.mni_field_visibility, 0, 1)
+            actor = plotter.add_mesh(
+                mesh, scalars="cohort_scalar", preference="point", cmap=scalar_colormap(self.mni_color_enhance),
+                clim=self._mni_cohort_scalar_limits(), opacity="field_opacity",
+                nan_opacity=0.0, lighting=False, reset_camera=False,
+                interpolate_before_map=True, show_scalar_bar=True,
+                scalar_bar_args={
+                    "title": title, "n_labels": 5, "fmt": "%.3g",
+                    "vertical": False, "position_x": 0.2, "position_y": 0.03,
+                    "width": 0.6, "height": 0.12, "title_font_size": 13,
+                    "label_font_size": 11,
+                },
+            )
+            self._detected_electrode_actors.append(actor)
+            self._mni_cohort_scalar_bar_title = title
+        self._render_plotter(plotter)
+        return True
+
     def _display_mni_cohort_electrodes(self):
-        """Render cylindrical cohort shafts in location-colored batched meshes."""
+        """Render batched contacts with categorical colors or per-contact scalars."""
         if not self.mni_cohort_active:
-            return
+            return False
         if self.brain is None or not hasattr(self.brain, "_renderer"):
-            return
+            return False
 
         try:
             import pyvista as pv
             from matplotlib import colors as mcolors
 
             t0 = time.perf_counter()
-            patient_filter = self.mni_cohort_patient_filter
+            selected_patients = self.mni_cohort_selected_patients
+            shown_indices = set(self._mni_cohort_display_indices())
+            scalar_mode = bool(self.mni_cohort_lookup and self.mni_cohort_scalar_column)
             coords_by_shaft = {}
-            for electrode in self.mni_cohort_electrodes:
+            for index, electrode in enumerate(self.mni_cohort_electrodes):
                 patient_id = electrode.get("cohort_patient") or "Unknown"
-                if patient_filter and patient_id != patient_filter:
-                    continue
-                if not electrode.get("visible", True):
+                if not cohort_contact_is_visible(electrode, selected_patients):
                     continue
                 source_shaft = electrode.get("source_shaft") or electrode.get("shaft") or "Unassigned"
                 location_key = self._mni_cohort_location_key(electrode)
@@ -1262,7 +2368,7 @@ class SEEGLocalizer:
                     continue
                 coords_by_shaft.setdefault(
                     (patient_id, source_shaft, location_key), []
-                ).append(world)
+                ).append((world, index))
 
             location_colors = self._mni_cohort_location_colors(
                 [location_key for _, _, location_key in coords_by_shaft]
@@ -1271,6 +2377,9 @@ class SEEGLocalizer:
             plotter = self.brain._renderer.plotter
             self._clear_detected_electrode_actors(plotter)
             self._detected_shaft_cache = None
+            self._mni_cohort_smooth_summary = {}
+            if scalar_mode and self.mni_cohort_smooth_enabled:
+                return self._display_mni_smooth_field(plotter, sorted(shown_indices))
 
             contact_meshes = {}
             tube_meshes = {}
@@ -1278,10 +2387,43 @@ class SEEGLocalizer:
             label_texts = []
             label_sides = []
             total_contacts = 0
+            self._mni_cohort_pooled_groups = []
+            if scalar_mode and self.mni_cohort_pool_enabled:
+                indices = sorted(shown_indices)
+                indices = [index for index in indices if np.all(np.isfinite(np.asarray([
+                    self.mni_cohort_electrodes[index].get(key)
+                    for key in ("mni_x", "mni_y", "mni_z")], dtype=float)))]
+                groups = pool_mni_contacts(
+                    [[self.mni_cohort_electrodes[index][key]
+                      for key in ("mni_x", "mni_y", "mni_z")] for index in indices],
+                    [self._mni_cohort_scalar_value(index) for index in indices],
+                    [self.mni_cohort_electrodes[index].get("cohort_patient") for index in indices],
+                    self.mni_cohort_pool_diameter,
+                )
+                centers = np.asarray([group["center"] for group in groups]).reshape(-1, 3)
+                if len(centers) and self.brain_surface in ("inflated", "flat"):
+                    centers = self._map_points_to_display_surface(centers)
+                for number, (group, center) in enumerate(zip(groups, centers), start=1):
+                    group["members"] = [indices[index] for index in group["members"]]
+                    mesh = pv.Sphere(center=center, radius=2.0, theta_resolution=24, phi_resolution=24)
+                    value = group["mean"] if group["mean"] is not None else np.nan
+                    mesh.cell_data["cohort_scalar"] = np.full(mesh.n_cells, value)
+                    contact_meshes.setdefault(None, []).append(mesh)
+                    mean_text = f"{value:.3g}" if np.isfinite(value) else "no values"
+                    label_positions.append(center)
+                    label_sides.append("left" if center[0] >= 0 else "right")
+                    label_texts.append(f"C{number} · {mean_text} · {group['contact_count']} contacts / "
+                                       f"{group['patient_count']} patients · n={group['value_count']}")
+                self._mni_cohort_pooled_groups = groups
+                total_contacts = len(indices)
+                coords_by_shaft = {}
             for (patient_id, source_shaft, location_key), coords in coords_by_shaft.items():
-                world = np.asarray(coords, dtype=float)
-                if self.brain_surface == "inflated":
-                    world = self._map_points_to_inflated(world)
+                world = np.asarray([point for point, _ in coords], dtype=float)
+                contact_indices = np.asarray([index for _, index in coords])
+                if not any(index in shown_indices for index in contact_indices):
+                    continue
+                if self.brain_surface in ("inflated", "flat"):
+                    world = self._map_points_to_display_surface(world)
 
                 center = np.mean(world, axis=0)
                 if len(world) > 1:
@@ -1297,6 +2439,8 @@ class SEEGLocalizer:
                 order = np.argsort(projection)
                 projection = projection[order]
                 world = world[order]
+                contact_indices = contact_indices[order]
+                included = np.asarray([index in shown_indices for index in contact_indices])
                 spacing = 2.0
                 if len(projection) > 1:
                     differences = np.diff(projection)
@@ -1305,26 +2449,39 @@ class SEEGLocalizer:
                         spacing = float(np.median(differences))
                 contact_height = max(1.0, min(3.0, spacing * 0.6))
 
-                location_contact_meshes = contact_meshes.setdefault(location_key, [])
-                for point in world:
-                    location_contact_meshes.append(
-                        pv.Cylinder(
-                            center=point,
-                            direction=axis,
-                            radius=0.8,
-                            height=contact_height,
-                            resolution=24,
-                        )
+                # Fit the axis/spacing to the full shaft before masking contacts,
+                # so filtering cannot change a retained contact's geometry.
+                mesh_key = None if scalar_mode else location_key
+                location_contact_meshes = contact_meshes.setdefault(mesh_key, [])
+                for point, index in zip(world[included], contact_indices[included]):
+                    mesh = pv.Cylinder(
+                        center=point,
+                        direction=axis,
+                        radius=0.8,
+                        height=contact_height,
+                        resolution=24,
                     )
+                    if scalar_mode:
+                        mesh.cell_data["cohort_scalar"] = np.full(
+                            mesh.n_cells, self._mni_cohort_scalar_value(index), dtype=float
+                        )
+                    location_contact_meshes.append(mesh)
                     total_contacts += 1
 
-                line_start = center + axis * np.min(projection)
-                line_end = center + axis * np.max(projection)
-                if not np.allclose(line_start, line_end):
-                    line = pv.Line(line_start, line_end)
-                    tube_meshes.setdefault(location_key, []).append(
-                        line.tube(radius=0.4, n_sides=16)
-                    )
+                line_start = center + axis * np.min(projection[included])
+                line_end = center + axis * np.max(projection[included])
+                # Only join adjacent retained contacts; do not draw a shaft
+                # through contacts omitted by the lookup filter.
+                for pair in range(len(world) - 1) if self.brain_surface != "flat" else ():
+                    if not (included[pair] and included[pair + 1]):
+                        continue
+                    start = center + axis * projection[pair]
+                    end = center + axis * projection[pair + 1]
+                    if not np.allclose(start, end):
+                        line = pv.Line(start, end)
+                        tube_meshes.setdefault(mesh_key, []).append(
+                            line.tube(radius=0.4, n_sides=16)
+                        )
 
                 # Anchor each label beyond the endpoint farthest from the brain
                 # center. The text is then justified away from the midline so its
@@ -1358,11 +2515,31 @@ class SEEGLocalizer:
                 if not meshes:
                     continue
                 merged = pv.merge(meshes, merge_points=False)
-                actor = plotter.add_mesh(
-                    merged,
-                    color=location_colors.get(location_key, "#333333"),
-                    opacity=0.9,
-                )
+                if scalar_mode:
+                    title = self.mni_cohort_scalar_column.replace("_baseline_minus_", "\nbaseline_minus_")
+                    if self.mni_color_enhance:
+                        title = "Asinh colors · " + title
+                    if self.mni_cohort_pool_enabled:
+                        title = "Mean · " + title
+                    actor = plotter.add_mesh(
+                        merged, scalars="cohort_scalar", preference="cell",
+                        cmap=scalar_colormap(self.mni_color_enhance), clim=self._mni_cohort_scalar_limits(),
+                        nan_color="#808080", nan_opacity=1.0,
+                        opacity=1.0, lighting=False, reset_camera=False, show_scalar_bar=True,
+                        scalar_bar_args={
+                            "title": title, "n_labels": 5, "fmt": "%.3g",
+                            "vertical": False, "position_x": 0.2, "position_y": 0.03,
+                            "width": 0.6, "height": 0.12, "title_font_size": 13,
+                            "label_font_size": 11, "nan_annotation": True,
+                        },
+                    )
+                    self._mni_cohort_scalar_bar_title = title
+                else:
+                    actor = plotter.add_mesh(
+                        merged,
+                        color=location_colors.get(location_key, "#333333"),
+                        opacity=0.9, reset_camera=False,
+                    )
                 self._detected_electrode_actors.append(actor)
 
             for location_key, meshes in tube_meshes.items():
@@ -1374,7 +2551,10 @@ class SEEGLocalizer:
                     dtype=float,
                 )
                 muted_color = tuple((rgb * 0.4 + np.array([0.6, 0.6, 0.6]) * 0.6).tolist())
-                actor = plotter.add_mesh(merged, color=muted_color, opacity=0.5)
+                actor = plotter.add_mesh(
+                    merged, color="#888888" if scalar_mode else muted_color,
+                    opacity=self.shaft_opacity, reset_camera=False,
+                )
                 self._detected_shaft_actors.append(actor)
 
             self._mni_cohort_label_positions = label_positions
@@ -1384,13 +2564,16 @@ class SEEGLocalizer:
 
             self._render_plotter(plotter)
             print(
-                f"Displayed {total_contacts} saved MNI cohort contacts as batched "
-                f"cylindrical shafts on fsaverage in {time.perf_counter() - t0:.2f}s."
+                f"Displayed {total_contacts} saved MNI cohort contacts "
+                f"({len(self._mni_cohort_pooled_groups)} pooled groups) "
+                f"on fsaverage in {time.perf_counter() - t0:.2f}s."
             )
+            return True
         except Exception as exc:
             print(f"Error displaying MNI cohort electrodes: {exc}")
             import traceback
             traceback.print_exc()
+            return False
 
     def clear_mni_cohort(self):
         """Leave cohort mode and restore the current patient's electrode display."""
@@ -1400,7 +2583,8 @@ class SEEGLocalizer:
         self.mni_cohort_active = False
         self.mni_cohort_electrodes = []
         self.mni_cohort_summary = None
-        self.mni_cohort_patient_filter = None
+        self.mni_cohort_selected_patients = None
+        self._match_mni_cohort_lookup()
         self._mni_cohort_label_positions = []
         self._mni_cohort_label_texts = []
         self._mni_cohort_label_sides = []
@@ -1485,10 +2669,19 @@ class SEEGLocalizer:
         """Orient the 3D viewer camera to a standard view."""
         if self.brain is None:
             return
+        if self.brain_surface == "flat":
+            self.brain.show_view("flat")
+            plotter = self.brain._renderer.plotter
+            plotter.enable_parallel_projection()
+            return
         view_map = {
             "Superior": ("dorsal", None),
             "Inferior": ("ventral", None),
             "Anterior": ("rostral", None),
+            "LAO20": ("rostral", "lh"),
+            "LAO30": ("rostral", "lh"),
+            "RAO20": ("rostral", "lh"),
+            "RAO30": ("rostral", "lh"),
             "Posterior": ("caudal", None),
             "Left": ("lateral", "lh"),
             "Right": ("lateral", "rh"),
@@ -1496,14 +2689,26 @@ class SEEGLocalizer:
         view, hemi = view_map.get(view_label, (None, None))
         if view is None:
             return
+        # RAS camera azimuth: anterior is 90 degrees, patient left is 180.
+        # Use explicit angles so the oblique presets are hemisphere-independent.
+        view_kwargs = {}
+        oblique_azimuths = {"LAO20": 110.0, "LAO30": 120.0,
+                            "RAO20": 70.0, "RAO30": 60.0}
+        if view_label in oblique_azimuths:
+            # Leave roll unset: MNE sets superior (+Z) as camera up.
+            # An explicit VTK roll of zero overrides that anatomical alignment.
+            view_kwargs = dict(
+                azimuth=oblique_azimuths[view_label],
+                elevation=90.0,
+            )
         try:
             if hemi is None:
-                self.brain.show_view(view)
+                self.brain.show_view(view, **view_kwargs)
             else:
-                self.brain.show_view(view, hemi=hemi)
+                self.brain.show_view(view, hemi=hemi, **view_kwargs)
         except Exception:
             try:
-                self.brain.show_view(view)
+                self.brain.show_view(view, **view_kwargs)
             except Exception:
                 pass
         if self.mni_cohort_active and self._mni_cohort_label_positions:
@@ -1584,6 +2789,9 @@ class SEEGLocalizer:
 
     def _finalize_brain_scene(self, reset_camera=True):
         """Apply consistent mesh visibility and camera settings after Brain creation."""
+        app = QApplication.instance()
+        if app is not None:
+            _apply_application_identity(app)
         if self.brain is None or not hasattr(self.brain, "_renderer"):
             return
         self._cache_brain_surface_actors()
@@ -1614,6 +2822,17 @@ class SEEGLocalizer:
                 pass
         self._render_plotter(plotter)
 
+    def _on_shaft_transparency_changed(self, value):
+        """Update connecting tubes immediately, leaving contacts and brain unchanged."""
+        value = max(0, min(100, int(value)))
+        self.shaft_opacity = (100 - value) / 100.0
+        if self.shaft_transparency_value_label is not None:
+            self.shaft_transparency_value_label.setText(f"{value}%")
+        for actor in self._detected_shaft_actors:
+            actor.GetProperty().SetOpacity(self.shaft_opacity)
+        if self.brain is not None and hasattr(self.brain, "_renderer"):
+            self._render_plotter(self.brain._renderer.plotter)
+
     def _on_brain_transparency_changed(self, value):
         """Handle UI changes for cortical transparency."""
         try:
@@ -1632,6 +2851,10 @@ class SEEGLocalizer:
         if not subject_id or not subjects_dir:
             return False
         surf_dir = Path(subjects_dir) / subject_id / "surf"
+        if surface_name == "flat":
+            return all((surf_dir / f"{hemi}.{name}").is_file()
+                       for hemi in ("lh", "rh")
+                       for name in ("cortex.patch.flat", "sphere", "white"))
         return (surf_dir / f"lh.{surface_name}").exists() and (surf_dir / f"rh.{surface_name}").exists()
 
     def _get_surface_vertices(self, surface_name):
@@ -1677,6 +2900,44 @@ class SEEGLocalizer:
         cache[key] = tree
         return tree
 
+    def _map_points_to_display_surface(self, points):
+        if self.brain_surface != "flat":
+            return self._map_points_to_inflated(points)
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if not len(points):
+            return points
+        from scipy.spatial import cKDTree
+
+        # Use the actual displayed geometry: MNE rotates flat patches and offsets
+        # hemispheres. Reading raw patch coordinates would misalign overlays.
+        subject, subjects_dir = self._get_brain_subject_info()
+        geometry = getattr(self.brain, "geo", {})
+        mapped = np.empty_like(points)
+        for hemi in ("lh", "rh"):
+            selected = points[:, 0] <= 0 if hemi == "lh" else points[:, 0] > 0
+            if not np.any(selected):
+                continue
+            geo = geometry.get(hemi)
+            if geo is None:
+                raise ValueError(f"No displayed {hemi} flatmap geometry")
+            key = (str(subjects_dir), subject, hemi, id(geo))
+            if key not in self._flat_projection_cache:
+                white, _ = mne.surface.read_surface(
+                    str(Path(subjects_dir) / subject / "surf" / f"{hemi}.white")
+                )
+                if len(white) != len(geo.coords):
+                    raise ValueError("Flatmap and white surface vertex counts differ")
+                # The patch omits medial-wall/cut vertices. Their zero-filled
+                # coordinates must never attract contacts to the map origin.
+                retained = np.unique(geo.faces)
+                if not len(retained):
+                    raise ValueError(f"The {hemi} flatmap has no retained triangles")
+                self._flat_projection_cache[key] = (cKDTree(white[retained]), retained)
+            tree, retained = self._flat_projection_cache[key]
+            _, nearest = tree.query(points[selected])
+            mapped[selected] = geo.coords[retained[nearest]]
+        return mapped
+
     def _map_points_to_inflated(self, points):
         """Map MRI-space points to inflated surface using vertex correspondence."""
         white = self._get_surface_vertices("white")
@@ -1705,29 +2966,91 @@ class SEEGLocalizer:
         idx = np.argmin(np.sum(diff * diff, axis=2), axis=1)
         return rr[idx]
 
-    def _sync_surface_toggle(self):
-        """Sync the surface checkbox with the current surface selection."""
-        if not hasattr(self, "inflated_surface_checkbox"):
-            return
-        self.inflated_surface_checkbox.blockSignals(True)
-        self.inflated_surface_checkbox.setChecked(self.brain_surface == "inflated")
-        self.inflated_surface_checkbox.blockSignals(False)
+    def _create_surface_controls(self, layout):
+        self.surface_button_group = QtWidgets.QButtonGroup(layout.parentWidget())
+        self.surface_button_group.setExclusive(True)
+        self.surface_buttons = {}
+        for surface, label in (("pial", "Pial"), ("inflated", "Inflated"), ("flat", "Flatmap")):
+            button = QtWidgets.QRadioButton(label)
+            button.setChecked(self.brain_surface == surface)
+            button.setEnabled(not self._surface_switch_in_progress)
+            button.toggled.connect(
+                lambda checked, target=surface: self._queue_surface_change(target) if checked else None
+            )
+            self.surface_button_group.addButton(button)
+            self.surface_buttons[surface] = button
+            layout.addWidget(button)
+        self.surface_buttons["flat"].setToolTip(
+            "Cortical flatmap. Contacts project to the nearest retained white-surface "
+            "vertex in their hemisphere; depth and 3D distances are not preserved."
+        )
 
-    def _toggle_inflated_surface(self, state):
-        """Toggle between inflated and default surface in the 3D viewer."""
-        target_surface = "inflated" if state == QtCore.Qt.Checked else "pial"
+    def _sync_surface_toggle(self):
+        """Sync mutually exclusive radio buttons without triggering a reload."""
+        buttons = self.surface_buttons
+        for button in buttons.values():
+            button.blockSignals(True)
+        for surface, button in buttons.items():
+            button.setChecked(self.brain_surface == surface)
+        for button in buttons.values():
+            button.blockSignals(False)
+
+    def _queue_surface_change(self, target_surface):
+        """Let Qt finish the radio-button event before replacing its controls.
+
+        Brain construction can process nested Qt events. Reloading synchronously
+        from toggled can delete the emitting button before setChecked finishes
+        its accessibility notification, causing a native macOS crash.
+        """
+        if self._surface_switch_in_progress:
+            return
+        self._pending_surface_change = target_surface
+        if not self._surface_change_scheduled:
+            self._surface_change_scheduled = True
+            QtCore.QTimer.singleShot(0, self._apply_pending_surface_change)
+
+    def _apply_pending_surface_change(self):
+        self._surface_change_scheduled = False
+        target = self._pending_surface_change
+        self._pending_surface_change = None
+        if target is None or self._surface_switch_in_progress:
+            return
+        self._surface_switch_in_progress = True
+        for button in self.surface_buttons.values():
+            button.setEnabled(False)
+        try:
+            self._select_brain_surface(target)
+        except Exception as exc:
+            # Never propagate an exception out of a Qt timer callback.
+            QtWidgets.QMessageBox.warning(None, "Surface Could Not Be Loaded", str(exc))
+        finally:
+            self._surface_switch_in_progress = False
+            self._sync_surface_toggle()
+            # Reload may have replaced the widgets; use the current controls.
+            for button in self.surface_buttons.values():
+                button.setEnabled(True)
+
+    def _select_brain_surface(self, target_surface):
         if target_surface == self.brain_surface:
             return
         if not self._surface_files_available(target_surface):
-            QtWidgets.QMessageBox.warning(
-                None,
-                "Surface Not Found",
-                f"Surface files for '{target_surface}' were not found for the current subject."
-            )
+            detail = ("Flatmap requires lh/rh.cortex.patch.flat, sphere, and white files "
+                      "in the current subject's surf directory."
+                      if target_surface == "flat" else
+                      f"Surface files for '{target_surface}' were not found for the current subject.")
+            QtWidgets.QMessageBox.warning(None, "Surface Not Found", detail)
             self._sync_surface_toggle()
             return
-        self._reload_brain_with_subject(surface=target_surface)
-    
+        previous_surface = self.brain_surface
+        try:
+            self._reload_brain_with_subject(surface=target_surface)
+        except Exception as exc:
+            self.brain_surface = previous_surface
+            self._sync_surface_toggle()
+            QtWidgets.QMessageBox.warning(None, "Surface Could Not Be Loaded", str(exc))
+            return
+        self._sync_surface_toggle()
+
     def _get_current_view(self):
         """Get the current view label from the view combo."""
         combo = getattr(self, "view_combo", None)
@@ -2087,33 +3410,36 @@ class SEEGLocalizer:
 
     def _reload_brain_with_subject(self, surface=None):
         """Reload the 3D brain viewer with the current custom subject."""
-        if surface:
-            self.brain_surface = surface
+        target_surface = surface or self.brain_surface
+        if target_surface == "flat" and not self._surface_files_available("flat"):
+            if surface is not None:
+                raise FileNotFoundError("The selected subject does not have flatmap surface files")
+            # A newly loaded patient may not have flat patches, unlike fsaverage.
+            target_surface = "pial"
+            print("  Flatmap unavailable for this subject; using pial surface")
         if self.brain is None:
+            self.brain_surface = target_surface
             print("  No brain viewer to reload - initializing from scratch")
-            # If no brain exists yet, just initialize the 3D layout
             self.init_3d_layout()
             return
-        
-        # Teardown existing brain viewer
-        print("  Cleaning up existing brain viewer...")
-        self._teardown_renderer()
-        self.brain = None
-        
-        # Recreate the brain with new subject
-        print("  Creating new brain viewer with custom subject...")
+
+        # Load first so invalid/mismatched patches cannot destroy the current view.
         subject_id, subjects_dir = self._get_brain_subject_info()
-        
-        self.brain = mne.viz.Brain(
+        new_brain = mne.viz.Brain(
             subject=subject_id,
             subjects_dir=subjects_dir,
             cortex=self.brain_cortex_style,
             alpha=self.brain_opacity,
             background="white",
-            surf=self.brain_surface,
-            silhouette=True,
+            surf=target_surface,
+            views="flat" if target_surface == "flat" else "lateral",
+            # Avoid decimating a planar patch just to create a 3D silhouette.
+            silhouette=target_surface != "flat",
             show=False,
         )
+        self._teardown_renderer()
+        self.brain = new_brain
+        self.brain_surface = target_surface
         self._finalize_brain_scene(reset_camera=True)
         
         # Reinitialize segmentation labels with custom subject
@@ -2144,8 +3470,7 @@ class SEEGLocalizer:
                 self._display_detected_electrodes(
                     self.detected_electrodes, self.detected_electrode_space
                 )
-            if hasattr(self, "inflated_surface_checkbox"):
-                self._sync_surface_toggle()
+            self._sync_surface_toggle()
             if self.brain_transparency_slider is not None:
                 self.brain_transparency_slider.blockSignals(True)
                 transparency_pct = int(round((1.0 - float(self.brain_opacity)) * 100))
@@ -2617,8 +3942,8 @@ class SEEGLocalizer:
             world_coords = coords_homogeneous @ affine.T
             world_coords = world_coords[:, :3]
             
-            if self.brain_surface == "inflated":
-                world_coords = self._map_points_to_inflated(world_coords)
+            if self.brain_surface in ("inflated", "flat"):
+                world_coords = self._map_points_to_display_surface(world_coords)
 
             # Create PyVista point cloud
             point_cloud = pv.PolyData(world_coords)
@@ -2872,8 +4197,8 @@ class SEEGLocalizer:
             for shaft_name, world in coords_by_shaft.items():
                 if world.size == 0:
                     continue
-                if self.brain_surface == "inflated":
-                    world = self._map_points_to_inflated(world)
+                if self.brain_surface in ("inflated", "flat"):
+                    world = self._map_points_to_display_surface(world)
                 point_cloud = pv.PolyData(world)
                 color = shaft_color_map.get(shaft_name, "#333333")
                 if selected_shaft:
@@ -2942,7 +4267,7 @@ class SEEGLocalizer:
         for shaft_name, bundle in actors_by_shaft.items():
             is_selected = bool(selected_shaft and shaft_name == selected_shaft)
             dim_others = bool(selected_shaft and shaft_name != selected_shaft)
-            tube_opacity = 0.7 if is_selected else (0.2 if dim_others else 0.5)
+            tube_opacity = self.shaft_opacity
             contact_opacity = 1.0 if is_selected else (0.35 if dim_others else 0.9)
             label_opacity = 1.0 if (not selected_shaft or is_selected) else 0.35
 
@@ -3019,7 +4344,7 @@ class SEEGLocalizer:
             contact_radius = 0.8
             default_contact_height = 2.0
 
-            use_inflated = self.brain_surface == "inflated"
+            use_inflated = self.brain_surface in ("inflated", "flat")
             signature_affine = "mni_world" if self._display_space_uses_mni_world(electrode_space) else affine
             signature = self._detected_shafts_signature(
                 coords_by_shaft,
@@ -3047,7 +4372,7 @@ class SEEGLocalizer:
                 world_center = self._transform_world_for_fsaverage(world_center)[0]
             if use_inflated and world_center is not None:
                 try:
-                    world_center = self._map_points_to_inflated(np.asarray([world_center]))[0]
+                    world_center = self._map_points_to_display_surface(np.asarray([world_center]))[0]
                 except Exception:
                     pass
             actors_by_shaft = {}
@@ -3061,11 +4386,11 @@ class SEEGLocalizer:
                     dim_others = bool(selected_shaft and shaft_name != selected_shaft)
                     shaft_radius_use = shaft_radius * (1.35 if is_selected else 1.0)
                     contact_radius_use = contact_radius * (1.35 if is_selected else (0.7 if dim_others else 1.0))
-                    tube_opacity = 0.7 if is_selected else (0.2 if dim_others else 0.5)
+                    tube_opacity = self.shaft_opacity
                     contact_opacity = 1.0 if is_selected else (0.35 if dim_others else 0.9)
                     world = np.asarray(coords, dtype=float)
                     if use_inflated:
-                        world = self._map_points_to_inflated(world)
+                        world = self._map_points_to_display_surface(world)
 
                     center = np.mean(world, axis=0)
                     if len(world) > 1:
@@ -3092,7 +4417,7 @@ class SEEGLocalizer:
 
                     line_start = center + axis * np.min(proj_sorted)
                     line_end = center + axis * np.max(proj_sorted)
-                    if not np.allclose(line_start, line_end):
+                    if self.brain_surface != "flat" and not np.allclose(line_start, line_end):
                         line = pv.Line(line_start, line_end)
                         if getattr(line, "n_points", 0) > 0:
                             muted_color = _mute_color(shaft_color_map.get(shaft_name, "#777777"))
@@ -3148,8 +4473,11 @@ class SEEGLocalizer:
                             [label_text],
                             text_color=contact_color,
                             font_size=12,
-                            point_size=0
+                            point_size=0,
+                            show_points=False,
+                            shape=None,
                         )
+                        label_actor.SetVisibility(bool(self.mni_cohort_show_labels))
                         self._detected_shaft_label_actors.append(label_actor)
                     except Exception:
                         label_actor = None
@@ -3169,8 +4497,8 @@ class SEEGLocalizer:
             if "Unassigned" in coords_by_shaft:
                 world = np.asarray(coords_by_shaft.get("Unassigned", []), dtype=float)
                 if world.size > 0:
-                    if self.brain_surface == "inflated":
-                        world = self._map_points_to_inflated(world)
+                    if self.brain_surface in ("inflated", "flat"):
+                        world = self._map_points_to_display_surface(world)
                     point_cloud = pv.PolyData(world)
                     if selected_shaft:
                         point_size = 8 if selected_shaft == "Unassigned" else 4
@@ -3196,8 +4524,11 @@ class SEEGLocalizer:
                             [label_text],
                             text_color="#777777",
                             font_size=12,
-                            point_size=0
+                            point_size=0,
+                            show_points=False,
+                            shape=None,
                         )
+                        label_actor.SetVisibility(bool(self.mni_cohort_show_labels))
                         self._detected_shaft_label_actors.append(label_actor)
                         unassigned_bundle["label"] = label_actor
                     except Exception:
@@ -3396,6 +4727,13 @@ class SEEGLocalizer:
 
     def _clear_detected_electrode_actors(self, plotter):
         """Remove any previously drawn detected electrode actors."""
+        scalar_bar_title = getattr(self, "_mni_cohort_scalar_bar_title", None)
+        if scalar_bar_title:
+            try:
+                plotter.remove_scalar_bar(scalar_bar_title, render=False)
+            except (KeyError, ValueError):
+                pass
+            self._mni_cohort_scalar_bar_title = None
         for actor in getattr(self, "_detected_electrode_actors", []):
             try:
                 plotter.remove_actor(actor)
@@ -4355,7 +5693,32 @@ class SEEGLocalizerMainWindow(QtWidgets.QMainWindow):
     def __init__(self, patient_reg_folder=None):
         super(SEEGLocalizerMainWindow, self).__init__()
         self.patient_reg_folder = patient_reg_folder
+        self._init_menus()
         self.initUI()
+
+    def _init_menus(self):
+        help_menu = self.menuBar().addMenu("&Help")
+        self.about_action = QtWidgets.QAction("About sEEG Localizer", self)
+        self.about_action.setMenuRole(QtWidgets.QAction.AboutRole)
+        self.about_action.triggered.connect(self._show_about)
+        help_menu.addAction(self.about_action)
+
+    def _show_about(self):
+        logo_path = Path(__file__).resolve().parent / "assets" / "wired-brains-logo.png"
+        logo_url = QtCore.QUrl.fromLocalFile(str(logo_path)).toString()
+        QtWidgets.QMessageBox.about(
+            self,
+            "About sEEG Localizer",
+            f"<h3>sEEG Localizer</h3><p>Version {_application_version()}</p>"
+            "<p>CT–MRI coregistration, electrode localization, and 3D visualization.</p>"
+            "<p>Copyright © 2026<br>Sunil Mathew, PhD</p>"
+            f'<p><img src="{logo_url}" width="280" height="193" '
+            'alt="Wired Brains Lab"></p>'
+            '<p><a href="https://wiredbrains.org">wiredbrains.org</a></p>'
+            "<p>Licensed under the MIT License. Use, modification, and redistribution "
+            "are permitted with the copyright and license notice retained.</p>"
+            "<p>Built with MNE-Python, PyVista, and Qt.</p>",
+        )
 
     def initUI(self):
         sig_view = pg.dockarea.DockArea()
@@ -4381,10 +5744,15 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    app = QApplication.instance() or QApplication([])
+    _prepare_application_identity()
+    app = QApplication.instance() or QApplication([APPLICATION_NAME])
+    # MNE installs its logo when the QApplication icon is empty. Set ours
+    # before constructing the viewer, which initializes MNE's Qt backend.
+    _apply_application_icon(app)
     window = SEEGLocalizerMainWindow(patient_reg_folder=args.patient_registration_folder)
-    window.show()
     window.setWindowTitle("sEEG Localizer")
+    _apply_application_icon(app, window)
+    window.show()
     return app.exec_()
 
 

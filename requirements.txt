@@ -1,2 +1,19 @@
--e .
+# Tested runtime environment for sEEG Localizer.
+# Keep these versions aligned with the runtime dependencies in pyproject.toml.
+h5py==3.15.1
+matplotlib==3.10.7
+mne==1.10.2
+nibabel==5.3.2
+numpy==2.0.2
+openpyxl==3.1.5
+Pillow==11.3.0
+PyQt5==5.15.11
+pyqtgraph==0.13.7
+pyvista==0.46.4
+pyvistaqt==0.11.3
+QtPy==2.4.3
+scipy==1.14.1
+vtk==9.5.2
 
+# Install the local package and its command-line entry point in editable mode.
+-e .

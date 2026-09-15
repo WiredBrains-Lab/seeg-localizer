@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from viewer3d.electrode import Electrode
+from viewer3d.cohort_lookup import subj_subject_id
 
 
 ELECTRODE_INFO_PATTERN = "*_elec_info.csv"
@@ -70,9 +71,17 @@ def discover_mni_electrode_files(root_path) -> list[Path]:
 
 
 def _patient_id_for_file(root: Path, csv_path: Path) -> str:
-    """Infer a stable patient label from the first folder below the cohort root."""
+    """Prefer an explicit SUBJ subject ancestor; otherwise use the first subfolder."""
     if root.is_file():
         root = root.parent
+    # The export has no subject column. Keep the actual folder label for the
+    # patient controls; the lookup join normalizes SUBJ_009 to SUBJ09.
+    # Include root itself so selecting one subject directory also works.
+    for directory in csv_path.parents:
+        if subj_subject_id(directory.name):
+            return directory.name
+        if directory == root:
+            break
     try:
         relative_parent = csv_path.parent.relative_to(root)
     except ValueError:
