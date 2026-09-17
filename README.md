@@ -14,6 +14,8 @@ in MNI space.
 - MNI cohort loading from saved `*_elec_info.csv` files
 - Per-contact scalar lookup coloring, table-based filtering, and separate cohort figure export
 
+<img width="1713" height="918" alt="seeg-localizer-paths-masked" src="https://github.com/user-attachments/assets/84a7e98c-c3c0-4d39-a825-12554b90f894" />
+
 ## Requirements
 
 - Python 3.10 or newer
